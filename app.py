@@ -1,15 +1,16 @@
 # app.py — INDICADORES QUALIDADE RS (WEB)
 # - Login com senha única: QualidadeRS
 # - Dashboard moderno (Plotly) com 4 gráficos coloridos por INTENSIDADE (2x2)
+# - Filtros completos por marcar (inclui Categoria)
 # - Exportar: Resumo Excel (DASHBOARD 2x2 + DADOS + RECORTE)
 # - Exportar: PDF do Dashboard (1 página, 2x2, colorido)
 #
-# Requisitos (requirements.txt):
+# Requisitos (requirements.txt) sugerido (pinado para Streamlit Cloud):
 # streamlit
 # pandas
 # openpyxl
-# plotly
-# kaleido
+# plotly==5.24.1
+# kaleido==0.2.1
 # reportlab
 
 import io
@@ -36,7 +37,7 @@ APP_NAME = "INDICADORES QUALIDADE RS"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
 
-# Colunas esperadas
+# Colunas esperadas (base Reclamações)
 COL_CODIGO = "Código"
 COL_TITULO = "Título"
 COL_STATUS = "Status"
@@ -45,10 +46,13 @@ COL_MOTIVO = "Motivo Reclamação"
 COL_TURNO = "Turno/Horário"
 COL_RESP_OCORRENCIA = "Responsável"
 COL_RESP_ANALISE = "Responsável da análise de causa"
+COL_CATEGORIA = "Categoria"
 COL_SITUACAO = "Situação"  # ATRASADA / NO PRAZO
 
+# ✅ Filtros por marcar (com Categoria incluída)
 FILTROS_COLS = [
     "Status",
+    "Categoria",
     "Cliente",
     "Motivo Reclamação",
     "Responsável",
@@ -65,7 +69,6 @@ MESES_ABREV = {
 }
 INV_MESES_ABREV = {v: k for k, v in MESES_ABREV.items()}
 
-# Escolha da escala contínua (pode trocar por: "Viridis", "Plasma", "Magma", "Turbo", "Blues", "Reds" etc.)
 CONTINUOUS_SCALE = "Turbo"
 
 
@@ -307,7 +310,7 @@ def carregar_df(upload_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     obrig = [COL_CODIGO, COL_TITULO, COL_STATUS, COL_DATA, COL_MOTIVO]
     for c in obrig:
         if c not in df.columns:
-            raise ValueError(f"Não encontrei a coluna obrigatória '{c}' na planilha: {c}")
+            raise ValueError(f"Não encontrei a coluna obrigatória '{c}' na planilha.")
 
     df = df.copy()
     df[COL_DATA] = pd.to_datetime(df[COL_DATA], errors="coerce", dayfirst=True)
@@ -351,16 +354,18 @@ def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filt
 # Cálculos de gráficos (base para dashboard/PDF)
 # =========================================================
 def calc_datasets(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, ano_ref: int):
+    dff = df_filtrado.copy()
+
     # 1) mês (recorte)
-    dff_mes = df_filtrado.copy()
+    dff_mes = dff.copy()
     dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
     g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
     df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
 
     # 2) resp análise (recorte)
     resp_rec = (
-        df_filtrado[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
-        if COL_RESP_ANALISE in df_filtrado.columns else pd.Series(["SEM RESPONSÁVEL"] * len(df_filtrado))
+        dff[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
+        if COL_RESP_ANALISE in dff.columns else pd.Series(["SEM RESPONSÁVEL"] * len(dff))
     )
     df_resp = resp_rec.value_counts().reset_index()
     df_resp.columns = ["Responsável (análise)", "Ocorrências"]
@@ -390,8 +395,8 @@ def calc_datasets(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, ano_ref: int
 
     # 4) motivo (top 12)
     top_mot = (
-        df_filtrado[COL_MOTIVO].fillna("").replace("", "SEM MOTIVO").value_counts().head(12)
-        if COL_MOTIVO in df_filtrado.columns else pd.Series(dtype=int)
+        dff[COL_MOTIVO].fillna("").replace("", "SEM MOTIVO").value_counts().head(12)
+        if COL_MOTIVO in dff.columns else pd.Series(dtype=int)
     )
     df_mot = top_mot.reset_index()
     df_mot.columns = ["Motivo", "Ocorrências"]
@@ -405,7 +410,6 @@ def calc_datasets(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, ano_ref: int
 # Gráficos por INTENSIDADE (escala contínua)
 # =========================================================
 def build_intensity_figs(df_mes, df_resp, df_atras, df_mot, ano_ref: int):
-    # Nota: color = medida numérica => escala contínua por intensidade
     fig_mes = px.bar(
         df_mes, x="Mês", y="Ocorrências", color="Ocorrências",
         color_continuous_scale=CONTINUOUS_SCALE,
@@ -530,7 +534,7 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
     _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — FILTRO ATUAL")
     ws2.row_dimensions[1].height = 26
 
-    cols_doc = [COL_CODIGO, COL_TITULO, COL_STATUS, COL_DATA, COL_MOTIVO, COL_RESP_ANALISE, COL_SITUACAO]
+    cols_doc = [COL_CODIGO, COL_TITULO, COL_STATUS, COL_DATA, COL_CATEGORIA, COL_MOTIVO, COL_RESP_ANALISE, COL_SITUACAO]
     cols_doc = [c for c in cols_doc if c in dff.columns]
 
     dff_out = dff.copy()
@@ -545,9 +549,10 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
     ws2.column_dimensions["B"].width = 70
     ws2.column_dimensions["C"].width = 16
     ws2.column_dimensions["D"].width = 16
-    ws2.column_dimensions["E"].width = 26
-    ws2.column_dimensions["F"].width = 30
-    ws2.column_dimensions["G"].width = 14
+    ws2.column_dimensions["E"].width = 18
+    ws2.column_dimensions["F"].width = 26
+    ws2.column_dimensions["G"].width = 30
+    ws2.column_dimensions["H"].width = 14
 
     if COL_SITUACAO in cols_doc:
         sit_col_idx = cols_doc.index(COL_SITUACAO) + 1
@@ -573,15 +578,8 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
 require_login()
 
-# Tema plotly base (colorido)
-try:
-    import plotly.io as pio
-    pio.templates.default = "plotly"
-except Exception:
-    pass
-
 st.title(f"📊 {APP_NAME}")
-st.caption("Gráficos por intensidade (quanto maior o valor, mais forte a cor), com exportação para Excel e PDF.")
+st.caption("Dashboard com filtros completos (inclui Categoria) + exportação Excel e PDF.")
 
 with st.sidebar:
     st.header("📥 Entrada")
@@ -600,6 +598,7 @@ except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
 
+# filtros rápidos (topo)
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
 c1, c2, c3, c4 = st.columns([1, 1, 1.6, 1.2])
 
@@ -617,11 +616,13 @@ with c3:
 with c4:
     show_table = st.toggle("Mostrar tabela", value=True)
 
+# filtros por marcar (com Categoria incluída)
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
     for i, col in enumerate(FILTROS_COLS):
         if col not in df_base.columns:
+            # se não existir na planilha, só ignora
             continue
         vals = sorted(df_base[col].dropna().astype(str).replace("nan", "").unique().tolist())
         vals = [v for v in vals if v != ""]
@@ -640,7 +641,7 @@ ano_ref = int(ano_sel) if ano_sel != "(Todos)" else ano_padrao_para_relatorios(d
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total ocorrências", total)
-k2.metric("Em atraso", atras)
+k2.metric("Em atraso (filtro)", atras)
 k3.metric("Período", f"{p_ini} → {p_fim}")
 k4.metric("Ano ref (atrasadas ano todo)", ano_ref)
 
@@ -673,7 +674,7 @@ with tab1:
 
 with tab2:
     if not total:
-        st.info("Quando houver registros no filtro, as exportações ficarão disponíveis.")
+        st.info("Quando houver registros no filtro, as exportações ficam disponíveis.")
         st.stop()
 
     filtro_txt = _titulo_filtro(ano_sel, mes_sel, resp_occ_sel)
@@ -699,7 +700,7 @@ with tab2:
         )
     except Exception as e:
         st.error(f"Erro ao gerar PDF. Detalhe: {e}")
-        st.caption("Se citar 'kaleido', reinstale requirements e reinicie: py -m pip install -r requirements.txt")
+        st.caption("Se citar kaleido/Chrome, mantenha plotly==5.24.1 e kaleido==0.2.1 no requirements.txt")
 
     st.divider()
     st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE)")
@@ -713,4 +714,5 @@ with tab2:
         file_name=f"Resumo_{APP_NAME.replace(' ', '_')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
