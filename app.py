@@ -1,17 +1,16 @@
-# app.py — INDICADORES QUALIDADE RS (WEB)
+# app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
 # - Login com senha única: QualidadeRS
-# - Dashboard moderno (Plotly) com 4 gráficos coloridos por INTENSIDADE (2x2)
+# - Dashboard moderno (Plotly) com 4 gráficos (2x2)
 # - Filtros completos por marcar (inclui Categoria)
-# - Exportar: Resumo Excel (DASHBOARD 2x2 + DADOS + RECORTE)
+# - Exportar: Resumo Excel (DASHBOARD + DADOS + RECORTE)
 # - Exportar: PDF do Dashboard (1 página, 2x2, colorido)
-#
-# Requisitos (requirements.txt) sugerido (pinado para Streamlit Cloud):
-# streamlit
-# pandas
-# openpyxl
-# plotly==5.24.1
-# kaleido==0.2.1
-# reportlab
+# - Drilldown no gráfico "Ocorrências": Ano -> Mês -> Semana do mês (clique na barra)
+# - Motivos seguem a seleção do gráfico "Ocorrências" (filtros + drill)
+# - NOVO (ajuste): Gráfico "Atrasadas por responsável (análise)" agora respeita o filtro de ANO:
+#     * Ano = 2025 => atrasadas apenas de 2025 (respeitando também os demais filtros por marcar)
+#     * Ano = (Todos) => atrasadas considerando todos os anos (respeitando demais filtros)
+#   OBS: esse gráfico continua "estático" no sentido de NÃO seguir o drill do gráfico ocorrências (ano/mês clicado),
+#        mas segue o filtro do topo (Ano/Mês/Resp ocorrência) + filtros por marcar.
 
 import io
 import pandas as pd
@@ -30,10 +29,12 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.utils import ImageReader
 
+
 # =========================================================
 # APP
 # =========================================================
-APP_NAME = "INDICADORES QUALIDADE RS"
+APP_VERSION = "V18.02.26"
+APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
 
@@ -126,6 +127,11 @@ def ano_padrao_para_relatorios(df: pd.DataFrame, col_data: str) -> int:
 
 def _titulo_filtro(ano_sel: str, mes_sel: str, resp_occ_sel: str) -> str:
     return f"Ano {ano_sel} | Mês {mes_sel} | Resp ocorrência {resp_occ_sel}"
+
+
+def semana_do_mes(dt_series: pd.Series) -> pd.Series:
+    d = pd.to_datetime(dt_series, errors="coerce")
+    return ((d.dt.day - 1) // 7 + 1).astype("Int64")
 
 
 # =========================================================
@@ -351,101 +357,244 @@ def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filt
 
 
 # =========================================================
-# Cálculos de gráficos (base para dashboard/PDF)
+# Drilldown (estado)
 # =========================================================
-def calc_datasets(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, ano_ref: int):
+def init_drill_state():
+    if "drill_level" not in st.session_state:
+        st.session_state.drill_level = "AUTO"  # AUTO / ANO / MES / SEMANA
+    if "drill_year" not in st.session_state:
+        st.session_state.drill_year = None
+    if "drill_month" not in st.session_state:
+        st.session_state.drill_month = None
+
+
+def reset_drill():
+    st.session_state.drill_level = "AUTO"
+    st.session_state.drill_year = None
+    st.session_state.drill_month = None
+
+
+def resolve_initial_level(ano_sel: str, mes_sel: str):
+    if ano_sel == "(Todos)":
+        return "ANO"
+    if mes_sel == "(Todos)":
+        return "MES"
+    return "SEMANA"
+
+
+def apply_drill_filters(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str) -> pd.DataFrame:
     dff = df_filtrado.copy()
 
-    # 1) mês (recorte)
-    dff_mes = dff.copy()
-    dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
-    g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
-    df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
+    if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
+        dff = dff[dff[COL_DATA].dt.year == int(st.session_state.drill_year)]
 
-    # 2) resp análise (recorte)
-    resp_rec = (
-        dff[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
-        if COL_RESP_ANALISE in dff.columns else pd.Series(["SEM RESPONSÁVEL"] * len(dff))
+    if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
+        dff = dff[dff[COL_DATA].dt.month == int(st.session_state.drill_month)]
+
+    return dff
+
+
+def occurrences_dataset(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str):
+    level = st.session_state.drill_level
+    if level == "AUTO":
+        level = resolve_initial_level(ano_sel, mes_sel)
+
+    breadcrumb = []
+
+    if level == "ANO":
+        g = df_filtrado.groupby(df_filtrado[COL_DATA].dt.year).size().sort_index()
+        df_plot = pd.DataFrame({"Ano": g.index.astype(int), "Ocorrências": g.values.astype(int)})
+        breadcrumb.append("Visão: Ano")
+        return df_plot, "ANO", " > ".join(breadcrumb)
+
+    # ano alvo
+    if ano_sel != "(Todos)":
+        ano_alvo = int(ano_sel)
+    else:
+        ano_alvo = int(st.session_state.drill_year) if st.session_state.drill_year is not None else None
+
+    if ano_alvo is None:
+        g = df_filtrado.groupby(df_filtrado[COL_DATA].dt.year).size().sort_index()
+        df_plot = pd.DataFrame({"Ano": g.index.astype(int), "Ocorrências": g.values.astype(int)})
+        breadcrumb.append("Visão: Ano")
+        return df_plot, "ANO", " > ".join(breadcrumb)
+
+    breadcrumb.append(f"Ano {ano_alvo}")
+    df_ano = df_filtrado[df_filtrado[COL_DATA].dt.year == ano_alvo].copy()
+
+    if level == "MES":
+        df_ano["MesNum"] = df_ano[COL_DATA].dt.month.astype(int)
+        g = df_ano.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
+        df_plot = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g.values.astype(int)})
+        breadcrumb.append("Visão: Mês")
+        return df_plot, "MES", " > ".join(breadcrumb)
+
+    # mês alvo
+    if mes_sel != "(Todos)":
+        mes_alvo = int(INV_MESES_ABREV.get(mes_sel))
+    else:
+        mes_alvo = int(st.session_state.drill_month) if st.session_state.drill_month is not None else None
+
+    if mes_alvo is None:
+        df_ano["MesNum"] = df_ano[COL_DATA].dt.month.astype(int)
+        g = df_ano.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
+        df_plot = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g.values.astype(int)})
+        breadcrumb.append("Visão: Mês")
+        return df_plot, "MES", " > ".join(breadcrumb)
+
+    breadcrumb.append(f"Mês {MESES_ABREV.get(mes_alvo, mes_alvo)}")
+    breadcrumb.append("Visão: Semana do mês")
+
+    df_mes = df_ano[df_ano[COL_DATA].dt.month == mes_alvo].copy()
+    df_mes["Semana"] = semana_do_mes(df_mes[COL_DATA])
+    g = df_mes.groupby("Semana").size().sort_index()
+
+    idx = [1, 2, 3, 4, 5]
+    g = g.reindex(idx, fill_value=0)
+    df_plot = pd.DataFrame({"Semana": [f"{i}ª" for i in idx], "Ocorrências": g.values.astype(int)})
+
+    return df_plot, "SEMANA", " > ".join(breadcrumb)
+
+
+def get_clicked_x(plotly_event):
+    if not plotly_event:
+        return None
+    try:
+        sel = plotly_event.get("selection", {})
+        pts = sel.get("points", [])
+        if pts:
+            return pts[0].get("x")
+    except Exception:
+        pass
+    try:
+        pts = plotly_event.get("points", [])
+        if pts:
+            return pts[0].get("x")
+    except Exception:
+        pass
+    return None
+
+
+# =========================================================
+# Datasets “seguidores” e estático (Atrasadas agora por FILTRO de ano)
+# =========================================================
+def calc_resp_analise(df_context: pd.DataFrame):
+    resp = (
+        df_context[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
+        if COL_RESP_ANALISE in df_context.columns else pd.Series(["SEM RESPONSÁVEL"] * len(df_context))
     )
-    df_resp = resp_rec.value_counts().reset_index()
+    df_resp = resp.value_counts().reset_index()
     df_resp.columns = ["Responsável (análise)", "Ocorrências"]
     if df_resp.empty:
         df_resp = pd.DataFrame({"Responsável (análise)": ["SEM DADOS"], "Ocorrências": [0]})
+    return df_resp
 
-    # 3) atrasadas resp análise (ano todo)
-    df_ano = df_base[df_base[COL_DATA].dt.year == ano_ref].copy()
-    resp_ano = (
-        df_ano[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
-        if COL_RESP_ANALISE in df_ano.columns else pd.Series(["SEM RESPONSÁVEL"] * len(df_ano))
-    )
-    sit_ano = (
-        df_ano[COL_SITUACAO].fillna("").apply(normalizar_situacao)
-        if COL_SITUACAO in df_ano.columns else pd.Series([""] * len(df_ano))
-    )
 
-    df_atras = (
-        pd.DataFrame({"Responsável (análise)": resp_ano, "Situação": sit_ano})
-        .query("Situação == 'ATRASADA'")["Responsável (análise)"]
-        .value_counts()
-        .reset_index()
-    )
-    df_atras.columns = ["Responsável (análise)", "Atrasadas (ano todo)"]
-    if df_atras.empty:
-        df_atras = pd.DataFrame({"Responsável (análise)": ["SEM DADOS"], "Atrasadas (ano todo)": [0]})
-
-    # 4) motivo (top 12)
+def calc_motivos(df_context: pd.DataFrame, top_n=12):
     top_mot = (
-        dff[COL_MOTIVO].fillna("").replace("", "SEM MOTIVO").value_counts().head(12)
-        if COL_MOTIVO in dff.columns else pd.Series(dtype=int)
+        df_context[COL_MOTIVO].fillna("").replace("", "SEM MOTIVO").value_counts().head(top_n)
+        if COL_MOTIVO in df_context.columns else pd.Series(dtype=int)
     )
     df_mot = top_mot.reset_index()
     df_mot.columns = ["Motivo", "Ocorrências"]
     if df_mot.empty:
         df_mot = pd.DataFrame({"Motivo": ["SEM DADOS"], "Ocorrências": [0]})
+    return df_mot
 
-    return df_mes, df_resp, df_atras, df_mot
+
+def calc_atrasadas_por_filtro(df_filtro_base: pd.DataFrame):
+    """
+    df_filtro_base = df já filtrado pelo topo + filtros por marcar (sem drill).
+    - Se Ano = 2025, df_filtro_base já está restrito a 2025.
+    - Se Ano = (Todos), df_filtro_base contempla todos os anos.
+    Retorna: atrasadas por responsável (análise) considerando SOMENTE esse df_filtro_base.
+    """
+    dfb = df_filtro_base.copy()
+
+    resp = (
+        dfb[COL_RESP_ANALISE].fillna("").replace("", "SEM RESPONSÁVEL")
+        if COL_RESP_ANALISE in dfb.columns else pd.Series(["SEM RESPONSÁVEL"] * len(dfb))
+    )
+    sit = (
+        dfb[COL_SITUACAO].fillna("").apply(normalizar_situacao)
+        if COL_SITUACAO in dfb.columns else pd.Series([""] * len(dfb))
+    )
+
+    df_atras = (
+        pd.DataFrame({"Responsável (análise)": resp, "Situação": sit})
+        .query("Situação == 'ATRASADA'")["Responsável (análise)"]
+        .value_counts()
+        .reset_index()
+    )
+    df_atras.columns = ["Responsável (análise)", "Atrasadas (filtro)"]
+    if df_atras.empty:
+        df_atras = pd.DataFrame({"Responsável (análise)": ["SEM DADOS"], "Atrasadas (filtro)": [0]})
+    return df_atras
 
 
 # =========================================================
-# Gráficos por INTENSIDADE (escala contínua)
+# Figuras Plotly (com número no topo)
 # =========================================================
-def build_intensity_figs(df_mes, df_resp, df_atras, df_mot, ano_ref: int):
-    fig_mes = px.bar(
-        df_mes, x="Mês", y="Ocorrências", color="Ocorrências",
-        color_continuous_scale=CONTINUOUS_SCALE,
-        title="Ocorrências por mês (filtro)"
-    )
-    fig_mes.update_layout(yaxis=dict(dtick=1), coloraxis_showscale=False)
+def fig_ocorrencias(df_plot: pd.DataFrame, level: str):
+    if level == "ANO":
+        fig = px.bar(
+            df_plot, x="Ano", y="Ocorrências", color="Ocorrências",
+            color_continuous_scale=CONTINUOUS_SCALE,
+            title="Ocorrências (clique para detalhar)"
+        )
+        fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
+        fig.update_layout(yaxis=dict(dtick=1), coloraxis_showscale=False)
+        return fig
 
-    fig_resp = px.bar(
-        df_resp, x="Responsável (análise)", y="Ocorrências", color="Ocorrências",
-        color_continuous_scale=CONTINUOUS_SCALE,
-        title="Ocorrências por responsável (análise) — filtro"
-    )
-    fig_resp.update_layout(xaxis_tickangle=-45, yaxis=dict(dtick=1), coloraxis_showscale=False)
+    if level == "MES":
+        fig = px.bar(
+            df_plot, x="Mês", y="Ocorrências", color="Ocorrências",
+            color_continuous_scale=CONTINUOUS_SCALE,
+            title="Ocorrências por mês (clique para detalhar por semana)"
+        )
+        fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
+        fig.update_layout(yaxis=dict(dtick=1), coloraxis_showscale=False)
+        return fig
 
-    fig_atras = px.bar(
-        df_atras, x="Responsável (análise)", y="Atrasadas (ano todo)", color="Atrasadas (ano todo)",
+    fig = px.bar(
+        df_plot, x="Semana", y="Ocorrências", color="Ocorrências",
         color_continuous_scale=CONTINUOUS_SCALE,
-        title=f"Atrasadas por responsável (análise) — ano {ano_ref}"
+        title="Ocorrências por semana do mês"
     )
-    fig_atras.update_layout(xaxis_tickangle=-45, yaxis=dict(dtick=1), coloraxis_showscale=False)
+    fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
+    fig.update_layout(yaxis=dict(dtick=1), coloraxis_showscale=False)
+    return fig
 
-    fig_mot = px.bar(
+
+def fig_resp(df_resp: pd.DataFrame, titulo: str):
+    ycol = df_resp.columns[1]
+    fig = px.bar(
+        df_resp, x="Responsável (análise)", y=ycol, color=ycol,
+        color_continuous_scale=CONTINUOUS_SCALE,
+        title=titulo
+    )
+    fig.update_traces(text=df_resp[ycol], textposition="outside", cliponaxis=False)
+    fig.update_layout(xaxis_tickangle=-45, yaxis=dict(dtick=1), coloraxis_showscale=False)
+    return fig
+
+
+def fig_motivos(df_mot: pd.DataFrame, titulo: str):
+    fig = px.bar(
         df_mot, x="Motivo", y="Ocorrências", color="Ocorrências",
         color_continuous_scale=CONTINUOUS_SCALE,
-        title="Ocorrências por motivo (Top 12) — filtro"
+        title=titulo
     )
-    fig_mot.update_layout(xaxis_tickangle=-45, yaxis=dict(dtick=1), coloraxis_showscale=False)
-
-    return fig_mes, fig_resp, fig_atras, fig_mot
+    fig.update_traces(text=df_mot["Ocorrências"], textposition="outside", cliponaxis=False)
+    fig.update_layout(xaxis_tickangle=-45, yaxis=dict(dtick=1), coloraxis_showscale=False)
+    return fig
 
 
 # =========================================================
-# Resumo Excel (DASHBOARD 2x2 + DADOS + RECORTE)
+# Resumo Excel (DASHBOARD + DADOS + RECORTE)
+# - Ajustado para usar atrasadas por filtro (não por ano_ref fixo)
 # =========================================================
-def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, titulo_filtro: str, ano_ref: int) -> bytes:
-    dff = df_filtrado.copy()
+def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd.DataFrame, titulo_filtro: str) -> bytes:
+    dff = df_filtrado_final.copy()
     theme = _excel_theme()
 
     total_rec = int(len(dff))
@@ -458,7 +607,20 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
     else:
         total_atras_rec = 0
 
-    df_mes, df_resp, df_atras, df_mot = calc_datasets(df_base, dff, ano_ref)
+    # 1) mês do recorte (sempre 12 meses)
+    dff_mes = dff.copy()
+    dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
+    g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
+    df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
+
+    # 2) resp análise (recorte)
+    df_resp = calc_resp_analise(dff)
+
+    # 3) atrasadas estático por filtro (df_filtro_base)
+    df_atras = calc_atrasadas_por_filtro(df_filtro_base)
+
+    # 4) motivos (top 12 recorte)
+    df_mot = calc_motivos(dff, top_n=12)
 
     wb = Workbook()
 
@@ -478,8 +640,8 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
 
     ws["B6"] = "Período (recorte):"; ws["B6"].font = Font(bold=True)
     ws["C6"] = f"{p_ini} a {p_fim}"
-    ws["D6"] = "Ano ref (atrasadas ano todo):"; ws["D6"].font = Font(bold=True)
-    ws["E6"] = ano_ref
+    ws["D6"] = "Versão:"; ws["D6"].font = Font(bold=True)
+    ws["E6"] = APP_VERSION
 
     for row in ws["B8:E10"]:
         for c in row:
@@ -487,10 +649,10 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
             c.alignment = Alignment(vertical="center", wrap_text=True)
     _apply_border(ws, "B8:E10")
 
-    ws["B8"] = "TOTAIS (FILTRO ATUAL)"; ws["B8"].font = Font(bold=True, size=12); ws.merge_cells("B8:E8")
+    ws["B8"] = "TOTAIS (RECORTE FINAL)"; ws["B8"].font = Font(bold=True, size=12); ws.merge_cells("B8:E8")
     ws["B9"] = "Total de ocorrências"; ws["B9"].font = Font(bold=True)
     ws["C9"] = total_rec; ws["C9"].font = Font(bold=True, size=14)
-    ws["D9"] = "Ocorrências em atraso"; ws["D9"].font = Font(bold=True)
+    ws["D9"] = "Ocorrências em atraso (recorte)"; ws["D9"].font = Font(bold=True)
     ws["E9"] = total_atras_rec; ws["E9"].font = Font(bold=True, size=14)
     ws["B10"] = "Obs.: tabelas base ficam na aba DADOS."; ws.merge_cells("B10:E10")
 
@@ -501,16 +663,16 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
     wsd.row_dimensions[2].height = 22
 
     r = 4
-    wsd[f"B{r}"] = "1) Ocorrências por mês (filtro)"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "1) Ocorrências por mês (recorte final)"; wsd[f"B{r}"].font = Font(bold=True)
     r1s, _, r1e, _, _ = _add_table(wsd, r + 1, 2, df_mes, table_name="T_MES", style="TableStyleMedium9")
 
     r = r1e + 3
-    wsd[f"B{r}"] = "2) Ocorrências por responsável (análise) — filtro"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "2) Ocorrências por responsável (análise) — recorte final"; wsd[f"B{r}"].font = Font(bold=True)
     r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP", style="TableStyleMedium9")
 
     r = r2e + 3
-    wsd[f"B{r}"] = f"3) Atrasadas por responsável (análise) — ano {ano_ref} (ano todo)"; wsd[f"B{r}"].font = Font(bold=True)
-    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_ANO", style="TableStyleMedium7")
+    wsd[f"B{r}"] = "3) Atrasadas por responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
+    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
 
     try:
         rng = f"C{r3s+1}:C{r3e}"
@@ -521,17 +683,17 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
         pass
 
     r = r3e + 3
-    wsd[f"B{r}"] = "4) Ocorrências por motivo (Top 12) — filtro"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "4) Ocorrências por motivo (Top 12) — recorte final"; wsd[f"B{r}"].font = Font(bold=True)
     r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
 
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (filtro)", 2, 3, r1s, r1e, "B12", "Ocorrências", False)
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por responsável (análise) — filtro", 2, 3, r2s, r2e, "D12", "Ocorrências", True)
-    _add_bar_chart_from_sheet(wsd, ws, f"Atrasadas por responsável (análise) — ano {ano_ref}", 2, 3, r3s, r3e, "B28", "Atrasadas", True)
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por motivo (Top 12) — filtro", 2, 3, r4s, r4e, "D28", "Ocorrências", True)
+    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12", "Ocorrências", False)
+    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por responsável (análise) — recorte", 2, 3, r2s, r2e, "D12", "Ocorrências", True)
+    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r3s, r3e, "B28", "Atrasadas", True)
+    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por motivo (Top 12) — recorte", 2, 3, r4s, r4e, "D28", "Ocorrências", True)
 
     ws2 = wb.create_sheet("RECORTE")
     ws2.sheet_view.showGridLines = True
-    _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — FILTRO ATUAL")
+    _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — RECORTE FINAL (FILTRO + DRILL)")
     ws2.row_dimensions[1].height = 26
 
     cols_doc = [COL_CODIGO, COL_TITULO, COL_STATUS, COL_DATA, COL_CATEGORIA, COL_MOTIVO, COL_RESP_ANALISE, COL_SITUACAO]
@@ -545,6 +707,7 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
         dff_out = dff_out[cols_doc].copy()
 
     _add_table(ws2, 3, 1, dff_out, table_name="T_RECORTE", style="TableStyleMedium9")
+
     ws2.column_dimensions["A"].width = 14
     ws2.column_dimensions["B"].width = 70
     ws2.column_dimensions["C"].width = 16
@@ -573,14 +736,16 @@ def build_resumo_excel_bytes(df_base: pd.DataFrame, df_filtrado: pd.DataFrame, t
 
 
 # =========================================================
-# UI Streamlit
+# UI Streamlit — ORDEM ORGANIZADA
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
 require_login()
+init_drill_state()
 
 st.title(f"📊 {APP_NAME}")
-st.caption("Dashboard com filtros completos (inclui Categoria) + exportação Excel e PDF.")
+st.caption("Dashboard com filtros completos (inclui Categoria) + exportação Excel/PDF + drilldown Ano→Mês→Semana no gráfico Ocorrências.")
 
+# 1) Sidebar: upload
 with st.sidebar:
     st.header("📥 Entrada")
     up = st.file_uploader("Envie o Excel (ex.: Consultas_RNC.xlsx)", type=["xlsx", "xlsm", "xls"])
@@ -592,15 +757,16 @@ if not up:
     st.info("Envie o arquivo Excel para começar.")
     st.stop()
 
+# 2) Carrega df_base
 try:
     df_base = carregar_df(up.getvalue(), sheet)
 except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
 
-# filtros rápidos (topo)
+# 3) Filtros rápidos (topo)
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
-c1, c2, c3, c4 = st.columns([1, 1, 1.6, 1.2])
+c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
 
 with c1:
     ano_sel = st.selectbox("Ano", ["(Todos)"] + [str(a) for a in anos], index=0)
@@ -615,14 +781,17 @@ with c3:
     resp_occ_sel = st.selectbox("Resp. ocorrência", ["(Todos)"] + resp_vals, index=0)
 with c4:
     show_table = st.toggle("Mostrar tabela", value=True)
+with c5:
+    if st.button("🔄 Reset drill"):
+        reset_drill()
+        st.rerun()
 
-# filtros por marcar (com Categoria incluída)
+# 4) Filtros por marcar
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
     for i, col in enumerate(FILTROS_COLS):
         if col not in df_base.columns:
-            # se não existir na planilha, só ignora
             continue
         vals = sorted(df_base[col].dropna().astype(str).replace("nan", "").unique().tolist())
         vals = [v for v in vals if v != ""]
@@ -630,6 +799,7 @@ with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
             sel = st.multiselect(col, options=vals, default=vals)
         multi_filters[col] = sel
 
+# 5) Aplica filtros base (sem drill)
 df_filtrado = aplicar_filtros(df_base, ano_sel, mes_sel, resp_occ_sel, multi_filters)
 
 total = int(len(df_filtrado))
@@ -637,13 +807,12 @@ situ = df_filtrado[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in 
 atras = int((situ == "ATRASADA").sum()) if total else 0
 p_ini = br_date_str(df_filtrado[COL_DATA].min()) if total else "-"
 p_fim = br_date_str(df_filtrado[COL_DATA].max()) if total else "-"
-ano_ref = int(ano_sel) if ano_sel != "(Todos)" else ano_padrao_para_relatorios(df_base, COL_DATA)
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total ocorrências", total)
 k2.metric("Em atraso (filtro)", atras)
 k3.metric("Período", f"{p_ini} → {p_fim}")
-k4.metric("Ano ref (atrasadas ano todo)", ano_ref)
+k4.metric("Versão", APP_VERSION)
 
 st.divider()
 tab1, tab2 = st.tabs(["📈 Dashboard", "📦 Exportações (Excel/PDF)"])
@@ -653,43 +822,151 @@ with tab1:
         st.warning("Sem registros no filtro atual.")
         st.stop()
 
-    df_mes, df_resp, df_atras, df_mot = calc_datasets(df_base, df_filtrado, ano_ref)
-    fig_mes, fig_resp, fig_atras, fig_mot = build_intensity_figs(df_mes, df_resp, df_atras, df_mot, ano_ref)
+    # Drill dataset (com base no df_filtrado)
+    df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
+    st.caption(f"📌 {breadcrumb}")
+
+    fig_occ = fig_ocorrencias(df_occ_plot, level_now)
+
+    # Render interativo (se Streamlit suportar on_select). Se não suportar, cai no fallback.
+    occ_event = None
+    click_supported = True
+    try:
+        occ_event = st.plotly_chart(
+            fig_occ,
+            use_container_width=True,
+            key="occ_chart",
+            on_select="rerun",
+            selection_mode="points",
+        )
+    except TypeError:
+        click_supported = False
+        st.plotly_chart(fig_occ, use_container_width=True)
+
+    # Clique -> muda drill
+    if click_supported:
+        clicked = get_clicked_x(occ_event)
+        if clicked is not None:
+            if level_now == "ANO" and ano_sel == "(Todos)":
+                try:
+                    st.session_state.drill_year = int(clicked)
+                    st.session_state.drill_level = "MES"
+                    st.session_state.drill_month = None
+                    st.rerun()
+                except Exception:
+                    pass
+            elif level_now == "MES" and mes_sel == "(Todos)":
+                mes_num = INV_MESES_ABREV.get(str(clicked))
+                if mes_num:
+                    st.session_state.drill_month = int(mes_num)
+                    st.session_state.drill_level = "SEMANA"
+                    st.rerun()
+
+    # Fallback manual (quando não existe clique)
+    if not click_supported:
+        st.warning("Seu Streamlit não suporta clique no Plotly neste modo. Ative o drill manual abaixo (mesmo resultado).")
+        fc1, fc2, fc3 = st.columns([1, 1, 1.2])
+
+        with fc1:
+            nivel_manual = st.selectbox("Nível", ["ANO", "MES", "SEMANA"], index=0)
+        with fc2:
+            ano_manual = st.selectbox("Ano (drill)", ["(Nenhum)"] + [str(a) for a in anos], index=0)
+        with fc3:
+            mes_manual = st.selectbox("Mês (drill)", ["(Nenhum)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0)
+
+        if st.button("Aplicar drill manual"):
+            if nivel_manual == "ANO":
+                st.session_state.drill_level = "ANO"
+                st.session_state.drill_year = None
+                st.session_state.drill_month = None
+            elif nivel_manual == "MES":
+                st.session_state.drill_level = "MES"
+                st.session_state.drill_year = int(ano_manual) if ano_manual != "(Nenhum)" else None
+                st.session_state.drill_month = None
+            else:
+                st.session_state.drill_level = "SEMANA"
+                st.session_state.drill_year = int(ano_manual) if ano_manual != "(Nenhum)" else None
+                st.session_state.drill_month = INV_MESES_ABREV.get(mes_manual) if mes_manual != "(Nenhum)" else None
+            st.rerun()
+
+    # df_final = filtros + drill (para motivos e resp análise)
+    df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+
+    # seguidores do drill
+    df_resp_sel = calc_resp_analise(df_final)
+    df_mot_sel = calc_motivos(df_final, top_n=12)
+
+    # ✅ atrasadas por responsável conforme FILTRO (sem drill)
+    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
+
+    fig_mot = fig_motivos(df_mot_sel, "Ocorrências por motivo (Top 12) — seguindo seleção do gráfico Ocorrências")
+    fig_resp_sel = fig_resp(df_resp_sel, "Ocorrências por responsável (análise) — seguindo seleção do gráfico Ocorrências")
+
+    # título do gráfico atrasadas: inclui ano selecionado, ou "Todos"
+    titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
+    fig_atras = fig_resp(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
     g1, g2 = st.columns(2)
     g3, g4 = st.columns(2)
 
     with g1:
-        st.plotly_chart(fig_mes, use_container_width=True)
+        st.info("⬆️ O gráfico 'Ocorrências' (interativo) está no topo.")
     with g2:
-        st.plotly_chart(fig_resp, use_container_width=True)
-    with g3:
-        st.plotly_chart(fig_atras, use_container_width=True)
-    with g4:
         st.plotly_chart(fig_mot, use_container_width=True)
+    with g3:
+        st.plotly_chart(fig_resp_sel, use_container_width=True)
+    with g4:
+        st.plotly_chart(fig_atras, use_container_width=True)
 
     if show_table:
-        st.subheader("Recorte (tabela)")
-        st.dataframe(df_filtrado.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
+        st.subheader("Recorte final (tabela) — filtros + drill")
+        st.dataframe(df_final.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
 
 with tab2:
     if not total:
         st.info("Quando houver registros no filtro, as exportações ficam disponíveis.")
         st.stop()
 
+    # export reflete filtros + drill
+    df_final_export = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+
     filtro_txt = _titulo_filtro(ano_sel, mes_sel, resp_occ_sel)
-    kpis_pdf = {"total": total, "atras": atras, "periodo": f"{p_ini} → {p_fim}", "ano_ref": ano_ref}
+    drill_txt = []
+    if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
+        drill_txt.append(f"Ano(clicado)={st.session_state.drill_year}")
+    if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
+        drill_txt.append(f"Mês(clicado)={MESES_ABREV.get(int(st.session_state.drill_month), st.session_state.drill_month)}")
+    if drill_txt:
+        filtro_txt = filtro_txt + " | Drill: " + " ; ".join(drill_txt)
+
+    total_final = int(len(df_final_export))
+    situ_final = df_final_export[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_final_export.columns and total_final) else pd.Series([], dtype=str)
+    atras_final = int((situ_final == "ATRASADA").sum()) if total_final else 0
+    p_ini_final = br_date_str(df_final_export[COL_DATA].min()) if total_final else "-"
+    p_fim_final = br_date_str(df_final_export[COL_DATA].max()) if total_final else "-"
+
+    kpis_pdf = {"total": total_final, "atras": atras_final, "periodo": f"{p_ini_final} → {p_fim_final}", "ano_ref": titulo_ano}
 
     st.subheader("📄 PDF do Dashboard (1 página, 4 gráficos)")
     try:
-        df_mes, df_resp, df_atras, df_mot = calc_datasets(df_base, df_filtrado, ano_ref)
-        fig_mes, fig_resp, fig_atras, fig_mot = build_intensity_figs(df_mes, df_resp, df_atras, df_mot, ano_ref)
+        df_occ_plot2, level_now2, _ = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
+        fig1 = fig_ocorrencias(df_occ_plot2, level_now2)
+
+        df_resp_sel2 = calc_resp_analise(df_final_export)
+        df_mot_sel2 = calc_motivos(df_final_export, top_n=12)
+
+        # atrasadas por filtro (sem drill)
+        df_atras_pdf = calc_atrasadas_por_filtro(df_filtrado)
+
+        fig2 = fig_motivos(df_mot_sel2, "Ocorrências por motivo (Top 12) — seleção do gráfico Ocorrências")
+        fig3 = fig_resp(df_resp_sel2, "Ocorrências por responsável (análise) — seleção do gráfico Ocorrências")
+        fig4 = fig_resp(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
             app_name=APP_NAME,
             filtro_txt=filtro_txt,
             kpis=kpis_pdf,
-            figs_plotly=[fig_mes, fig_resp, fig_atras, fig_mot],
+            figs_plotly=[fig1, fig2, fig3, fig4],
         )
 
         st.download_button(
@@ -706,7 +983,7 @@ with tab2:
     st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE)")
 
     titulo_filtro = f"Reclamações — Filtro atual | {filtro_txt}"
-    resumo_bytes = build_resumo_excel_bytes(df_base, df_filtrado, titulo_filtro, ano_ref)
+    resumo_bytes = build_resumo_excel_bytes(df_final_export, df_filtrado, titulo_filtro)
 
     st.download_button(
         label="📥 Baixar Resumo Excel",
@@ -714,5 +991,3 @@ with tab2:
         file_name=f"Resumo_{APP_NAME.replace(' ', '_')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
