@@ -1,11 +1,14 @@
 # app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
 # Ajustes desta versão:
-# - Gráfico interativo (Ocorrências): barra VERDE <= 8, VERMELHA > 8 (por ponto)
-# - Gráfico Motivos: mesmo tamanho do gráfico interativo (mesma altura/padrão visual)
-# - Gráfico Atrasadas por responsável: barras sempre VERMELHAS
-# - Eixo Y sem valores (mantido)
-# - Valores no topo das barras (mantido)
-# - Botão "Voltar (um nível)" no drill (mantido)
+# - Gráfico interativo (Ocorrências): VERDE <= 8, VERMELHO > 8 + rótulo no topo + sem rótulos eixo Y
+# - Top 12 Motivos: MESMA dimensão do gráfico interativo (lado a lado, mesma altura)
+# - NOVO: Pizza (participação por Responsável da análise) seguindo a seleção do gráfico interativo
+# - Atrasadas por responsável: barras SEMPRE vermelhas (seguindo filtro, sem drill)
+# - Exportações:
+#   - PDF: 1 página (2x2): Ocorrências (drill) + Motivos + Pizza + Atrasadas
+#   - Excel: Dashboard com 4 gráficos (mesma estrutura do painel: sem gridlines, sem rótulos eixo Y, com rótulos nas barras)
+#            + inclusão da pizza e tabela base correspondente
+# - Excel: gráficos sem linhas de grade e sem rótulos do eixo Y (e com data labels)
 
 import io
 import pandas as pd
@@ -17,8 +20,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.chart import BarChart
+
+from openpyxl.chart import BarChart, PieChart
 from openpyxl.chart.reference import Reference
+from openpyxl.chart.label import DataLabelList
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape
@@ -69,6 +74,7 @@ INV_MESES_ABREV = {v: k for k, v in MESES_ABREV.items()}
 LIMIAR_OCORRENCIAS = 8  # <=8 verde, >8 vermelho
 GREEN = "#2E7D32"
 RED = "#C62828"
+BLUE = "#1f77b4"
 
 
 # =========================================================
@@ -128,7 +134,7 @@ def semana_do_mes(dt_series: pd.Series) -> pd.Series:
 
 
 # =========================================================
-# Excel helpers (mantidos)
+# Excel helpers
 # =========================================================
 def _excel_theme():
     return {
@@ -199,16 +205,61 @@ def _add_table(ws, start_row, start_col, df: pd.DataFrame, table_name: str, styl
     return (start_row, start_col, end_row, end_col, ref)
 
 
-def _chart_set_integer_y(chart: BarChart):
+def _hex_no_hash(hex_color: str) -> str:
+    return hex_color.replace("#", "").upper()
+
+
+def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str | None):
+    # Sem gridlines
     try:
-        chart.y_axis.majorUnit = 1
+        chart.y_axis.majorGridlines = None
+        chart.y_axis.minorGridlines = None
+        chart.x_axis.majorGridlines = None
+        chart.x_axis.minorGridlines = None
     except Exception:
         pass
 
-
-def _chart_set_x_45(chart: BarChart):
+    # Sem rótulos do eixo Y
     try:
-        chart.x_axis.textRotation = 45
+        chart.y_axis.tickLblPos = "none"
+    except Exception:
+        pass
+
+    # Data labels (valor na barra)
+    try:
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        chart.dLbls.showLegendKey = False
+        chart.dLbls.showCatName = False
+        chart.dLbls.showSerName = False
+    except Exception:
+        pass
+
+    # Rotação X
+    if rotate_x_45:
+        try:
+            chart.x_axis.textRotation = 45
+        except Exception:
+            pass
+
+    # Cor sólida na série
+    if solid_fill_hex:
+        try:
+            s = chart.series[0]
+            s.graphicalProperties.solidFill = _hex_no_hash(solid_fill_hex)
+            s.graphicalProperties.line.solidFill = _hex_no_hash(solid_fill_hex)
+        except Exception:
+            pass
+
+
+def _style_xl_pie_chart(chart: PieChart):
+    # Data labels (categoria + percentual)
+    try:
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showPercent = True
+        chart.dLbls.showCatName = True
+        chart.dLbls.showLegendKey = False
+        chart.dLbls.showVal = False
     except Exception:
         pass
 
@@ -216,14 +267,14 @@ def _chart_set_x_45(chart: BarChart):
 def _add_bar_chart_from_sheet(
     data_ws, target_ws,
     title, cat_col, val_col, start_row, end_row, anchor_cell,
-    y_title="Ocorrências", rotate_x_45=False,
-    height=7.2, width=12.5
+    rotate_x_45=False,
+    height=7.2, width=12.5,
+    solid_fill_hex=None
 ):
     chart = BarChart()
     chart.type = "col"
     chart.style = 10
     chart.title = title
-    chart.y_axis.title = y_title
     chart.legend = None
     chart.height = float(height)
     chart.width = float(width)
@@ -233,10 +284,26 @@ def _add_bar_chart_from_sheet(
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
 
-    _chart_set_integer_y(chart)
-    if rotate_x_45:
-        _chart_set_x_45(chart)
+    _style_xl_bar_chart(chart, rotate_x_45=rotate_x_45, solid_fill_hex=solid_fill_hex)
+    target_ws.add_chart(chart, anchor_cell)
 
+
+def _add_pie_chart_from_sheet(
+    data_ws, target_ws,
+    title, cat_col, val_col, start_row, end_row, anchor_cell,
+    height=7.2, width=12.5
+):
+    chart = PieChart()
+    chart.title = title
+    chart.height = float(height)
+    chart.width = float(width)
+
+    data = Reference(data_ws, min_col=val_col, min_row=start_row, max_row=end_row)
+    cats = Reference(data_ws, min_col=cat_col, min_row=start_row + 1, max_row=end_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+
+    _style_xl_pie_chart(chart)
     target_ws.add_chart(chart, anchor_cell)
 
 
@@ -488,7 +555,7 @@ def go_back_one_level(level_now: str, ano_sel: str, mes_sel: str):
 
 
 # =========================================================
-# Datasets
+# Datasets (seguindo seleção)
 # =========================================================
 def calc_resp_analise(df_context: pd.DataFrame):
     resp = (
@@ -547,19 +614,7 @@ def _hide_yaxis(fig):
     return fig
 
 
-def _apply_single_color(fig, color_hex: str):
-    fig.update_traces(marker_color=color_hex)
-    return fig
-
-
-def _apply_threshold_colors(fig, values, threshold: int):
-    # cor por barra (ponto): verde <= threshold, vermelho > threshold
-    colors = [GREEN if int(v) <= threshold else RED for v in values]
-    fig.update_traces(marker_color=colors)
-    return fig
-
-
-def _common_bar_layout(fig, height=420):
+def _common_bar_layout(fig, height=460):
     fig.update_layout(
         height=height,
         margin=dict(l=10, r=10, t=55, b=10),
@@ -567,11 +622,13 @@ def _common_bar_layout(fig, height=420):
     return fig
 
 
-# =========================================================
-# Figuras
-# =========================================================
+def _apply_threshold_colors(fig, values, threshold: int):
+    colors = [GREEN if int(v) <= threshold else RED for v in values]
+    fig.update_traces(marker_color=colors)
+    return fig
+
+
 def fig_ocorrencias(df_plot: pd.DataFrame, level: str):
-    # gráfico interativo com regra verde/vermelho por barra
     if level == "ANO":
         fig = px.bar(df_plot, x="Ano", y="Ocorrências", title="Ocorrências (clique para detalhar)")
         fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
@@ -597,41 +654,34 @@ def fig_ocorrencias(df_plot: pd.DataFrame, level: str):
 
 
 def fig_motivos(df_mot: pd.DataFrame, titulo: str):
-    # mesmo tamanho do gráfico interativo (altura 460)
     fig = px.bar(df_mot, x="Motivo", y="Ocorrências", title=titulo)
-    fig.update_traces(text=df_mot["Ocorrências"], textposition="outside", cliponaxis=False)
+    fig.update_traces(text=df_mot["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
     fig.update_layout(xaxis_tickangle=-45)
-    _apply_single_color(fig, "#1f77b4")  # azul padrão para motivos
     _hide_yaxis(fig)
-    _common_bar_layout(fig, height=460)
+    _common_bar_layout(fig, height=460)  # mesma dimensão do interativo
     return fig
 
 
-def fig_resp_azul(df_resp: pd.DataFrame, titulo: str):
-    ycol = df_resp.columns[1]
-    fig = px.bar(df_resp, x="Responsável (análise)", y=ycol, title=titulo)
-    fig.update_traces(text=df_resp[ycol], textposition="outside", cliponaxis=False)
-    fig.update_layout(xaxis_tickangle=-45)
-    _apply_single_color(fig, "#1f77b4")
-    _hide_yaxis(fig)
-    _common_bar_layout(fig, height=420)
+def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
+    # pizza (participação) seguindo df_resp (que já segue seleção do interativo)
+    fig = px.pie(df_resp, names="Responsável (análise)", values="Ocorrências", title=titulo, hole=0.35)
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
     return fig
 
 
 def fig_atrasadas_vermelho(df_atras: pd.DataFrame, titulo: str):
-    # barras sempre vermelhas
     ycol = df_atras.columns[1]
     fig = px.bar(df_atras, x="Responsável (análise)", y=ycol, title=titulo)
-    fig.update_traces(text=df_atras[ycol], textposition="outside", cliponaxis=False)
+    fig.update_traces(text=df_atras[ycol], textposition="outside", cliponaxis=False, marker_color=RED)
     fig.update_layout(xaxis_tickangle=-45)
-    _apply_single_color(fig, RED)
     _hide_yaxis(fig)
-    _common_bar_layout(fig, height=420)
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10))
     return fig
 
 
 # =========================================================
-# Resumo Excel (mantido)
+# Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza
 # =========================================================
 def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd.DataFrame, titulo_filtro: str) -> bytes:
     dff = df_filtrado_final.copy()
@@ -647,16 +697,24 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     else:
         total_atras_rec = 0
 
+    # 1) dados para ocorrências por mês (para Excel manter padrão "mensal")
     dff_mes = dff.copy()
     dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
     g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
     df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
 
+    # 2) responsáveis (seleção do interativo)
     df_resp = calc_resp_analise(dff)
+
+    # 3) atrasadas (conforme filtro SEM drill)
     df_atras = calc_atrasadas_por_filtro(df_filtro_base)
+
+    # 4) motivos top 12 (seleção do interativo)
     df_mot = calc_motivos(dff, top_n=12)
 
     wb = Workbook()
+
+    # DASHBOARD
     ws = wb.active
     ws.title = "DASHBOARD"
     ws.sheet_view.showGridLines = False
@@ -689,9 +747,10 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     ws["E9"] = total_atras_rec; ws["E9"].font = Font(bold=True, size=14)
     ws["B10"] = "Obs.: tabelas base ficam na aba DADOS."; ws.merge_cells("B10:E10")
 
+    # DADOS
     wsd = wb.create_sheet("DADOS")
     wsd.sheet_view.showGridLines = True
-    _set_col_widths(wsd, {"A": 2, "B": 34, "C": 20, "D": 34, "E": 20, "F": 2})
+    _set_col_widths(wsd, {"A": 2, "B": 34, "C": 22, "D": 34, "E": 22, "F": 2})
     _merge_title(wsd, "B2:E2", "DADOS — NÃO EDITAR (BASE DOS GRÁFICOS)")
     wsd.row_dimensions[2].height = 22
 
@@ -700,30 +759,55 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     r1s, _, r1e, _, _ = _add_table(wsd, r + 1, 2, df_mes, table_name="T_MES", style="TableStyleMedium9")
 
     r = r1e + 3
-    wsd[f"B{r}"] = "2) Ocorrências por responsável (análise) — recorte final"; wsd[f"B{r}"].font = Font(bold=True)
-    r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP", style="TableStyleMedium9")
+    wsd[f"B{r}"] = "2) Motivos (Top 12) — recorte final"; wsd[f"B{r}"].font = Font(bold=True)
+    r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
 
     r = r2e + 3
-    wsd[f"B{r}"] = "3) Atrasadas por responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
-    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
+    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — recorte final (para Pizza)"; wsd[f"B{r}"].font = Font(bold=True)
+    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_PIE", style="TableStyleMedium9")
 
+    r = r3e + 3
+    wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
+    r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
+
+    # Destaque atrasadas > 0 (na tabela)
     try:
-        rng = f"C{r3s+1}:C{r3e}"
+        rng = f"C{r4s+1}:C{r4e}"
         wsd.conditional_formatting.add(
             rng, CellIsRule(operator="greaterThan", formula=["0"], fill=PatternFill("solid", fgColor="FFC7CE"))
         )
     except Exception:
         pass
 
-    r = r3e + 3
-    wsd[f"B{r}"] = "4) Ocorrências por motivo (Top 12) — recorte final"; wsd[f"B{r}"].font = Font(bold=True)
-    r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
+    # Gráficos (estrutura igual ao painel: sem gridlines, sem rótulos eixo y, com rótulos de dados)
+    # Layout 2x2 na DASHBOARD:
+    # B12: Ocorrências por mês (azul)
+    # D12: Motivos top 12 (azul)
+    # B28: Pizza participação por responsável (pizza)
+    # D28: Atrasadas por responsável (vermelho)
 
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12", "Ocorrências", False)
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por responsável (análise) — recorte", 2, 3, r2s, r2e, "D12", "Ocorrências", True)
-    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r3s, r3e, "B28", "Atrasadas", True)
-    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por motivo (Top 12) — recorte", 2, 3, r4s, r4e, "D28", "Ocorrências", True)
+    _add_bar_chart_from_sheet(
+        wsd, ws,
+        "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12",
+        rotate_x_45=False, height=7.2, width=12.5, solid_fill_hex=BLUE
+    )
+    _add_bar_chart_from_sheet(
+        wsd, ws,
+        "Motivos (Top 12) — recorte", 2, 3, r2s, r2e, "D12",
+        rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE
+    )
+    _add_pie_chart_from_sheet(
+        wsd, ws,
+        "Participação por responsável (análise) — recorte", 2, 3, r3s, r3e, "B28",
+        height=7.2, width=12.5
+    )
+    _add_bar_chart_from_sheet(
+        wsd, ws,
+        "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r4s, r4e, "D28",
+        rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=RED
+    )
 
+    # RECORTE
     ws2 = wb.create_sheet("RECORTE")
     ws2.sheet_view.showGridLines = True
     _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — RECORTE FINAL (FILTRO + DRILL)")
@@ -776,7 +860,7 @@ require_login()
 init_drill_state()
 
 st.title(f"📊 {APP_NAME}")
-st.caption("Dashboard com filtros completos + exportação Excel/PDF + drilldown no gráfico Ocorrências.")
+st.caption("Dashboard com filtros completos + exportação Excel/PDF + drilldown no gráfico Ocorrências + Pizza de participação por responsável.")
 
 with st.sidebar:
     st.header("📥 Entrada")
@@ -860,6 +944,7 @@ with tab1:
     st.caption(f"📌 {breadcrumb}")
     fig_occ = fig_ocorrencias(df_occ_plot, level_now)
 
+    # Render interativo (clique)
     occ_event = None
     click_supported = True
     try:
@@ -892,30 +977,32 @@ with tab1:
                     st.session_state.drill_level = "SEMANA"
                     st.rerun()
 
+    # Base final (filtros + drill) para Motivos + Pizza
     df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
 
-    df_resp_sel = calc_resp_analise(df_final)
     df_mot_sel = calc_motivos(df_final, top_n=12)
+    df_resp_sel = calc_resp_analise(df_final)  # usado na pizza (participação)
 
+    # Atrasadas por responsável conforme FILTRO (sem drill)
     df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
 
+    fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
+    fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
     titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
-    fig_mot = fig_motivos(df_mot_sel, "Ocorrências por motivo (Top 12) — seguindo seleção do gráfico Ocorrências")
-    fig_resp_sel = fig_resp_azul(df_resp_sel, "Ocorrências por responsável (análise) — seguindo seleção do gráfico Ocorrências")
     fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
-    # Layout: motivos com MESMO tamanho do interativo (altura). Deixo lado a lado.
-    left, right = st.columns(2)
-    with left:
+    # Linha 1: Ocorrências + Motivos (mesma dimensão)
+    row1_left, row1_right = st.columns(2)
+    with row1_left:
         st.plotly_chart(fig_occ, use_container_width=True)
-    with right:
+    with row1_right:
         st.plotly_chart(fig_mot, use_container_width=True)
 
-    # segunda linha
-    g3, g4 = st.columns(2)
-    with g3:
-        st.plotly_chart(fig_resp_sel, use_container_width=True)
-    with g4:
+    # Linha 2: Pizza + Atrasadas
+    row2_left, row2_right = st.columns(2)
+    with row2_left:
+        st.plotly_chart(fig_pie, use_container_width=True)
+    with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
     if show_table:
@@ -948,17 +1035,17 @@ with tab2:
 
     st.subheader("📄 PDF do Dashboard (1 página, 4 gráficos)")
     try:
+        # PDF 2x2: Ocorrências + Motivos + Pizza + Atrasadas
         df_occ_plot2, level_now2, _ = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
         fig1 = fig_ocorrencias(df_occ_plot2, level_now2)
 
-        df_resp_sel2 = calc_resp_analise(df_final_export)
-        df_mot_sel2 = calc_motivos(df_final_export, top_n=12)
-
+        df_mot_pdf = calc_motivos(df_final_export, top_n=12)
+        df_resp_pdf = calc_resp_analise(df_final_export)
         df_atras_pdf = calc_atrasadas_por_filtro(df_filtrado)
 
         titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
-        fig2 = fig_motivos(df_mot_sel2, "Ocorrências por motivo (Top 12) — seleção do gráfico Ocorrências")
-        fig3 = fig_resp_azul(df_resp_sel2, "Ocorrências por responsável (análise) — seleção do gráfico Ocorrências")
+        fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
+        fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
         fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
@@ -979,7 +1066,7 @@ with tab2:
         st.caption("Se citar kaleido/Chrome, mantenha plotly==5.24.1 e kaleido==0.2.1 no requirements.txt")
 
     st.divider()
-    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE)")
+    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza")
 
     titulo_filtro = f"Reclamações — Filtro atual | {filtro_txt}"
     resumo_bytes = build_resumo_excel_bytes(df_final_export, df_filtrado, titulo_filtro)
