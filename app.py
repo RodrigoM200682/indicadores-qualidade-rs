@@ -1,14 +1,7 @@
 # app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
-# Ajustes desta versão:
-# - Gráfico interativo (Ocorrências): VERDE <= 8, VERMELHO > 8 + rótulo no topo + sem rótulos eixo Y
-# - Top 12 Motivos: MESMA dimensão do gráfico interativo (lado a lado, mesma altura)
-# - NOVO: Pizza (participação por Responsável da análise) seguindo a seleção do gráfico interativo
-# - Atrasadas por responsável: barras SEMPRE vermelhas (seguindo filtro, sem drill)
-# - Exportações:
-#   - PDF: 1 página (2x2): Ocorrências (drill) + Motivos + Pizza + Atrasadas
-#   - Excel: Dashboard com 4 gráficos (mesma estrutura do painel: sem gridlines, sem rótulos eixo Y, com rótulos nas barras)
-#            + inclusão da pizza e tabela base correspondente
-# - Excel: gráficos sem linhas de grade e sem rótulos do eixo Y (e com data labels)
+# Atualização desta versão:
+# - A TABELA FINAL agora mostra SOMENTE as reclamações referentes à BARRA clicada no gráfico de Ocorrências
+#   (Ano / Mês / Semana). Incluí também um botão para “Limpar seleção da tabela”.
 
 import io
 import pandas as pd
@@ -33,7 +26,7 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V18.02.26_VF"
+APP_VERSION = "V18.02.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -210,7 +203,6 @@ def _hex_no_hash(hex_color: str) -> str:
 
 
 def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str | None):
-    # Sem gridlines
     try:
         chart.y_axis.majorGridlines = None
         chart.y_axis.minorGridlines = None
@@ -218,31 +210,20 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
         chart.x_axis.minorGridlines = None
     except Exception:
         pass
-
-    # Sem rótulos do eixo Y
     try:
         chart.y_axis.tickLblPos = "none"
     except Exception:
         pass
-
-    # Data labels (valor na barra)
     try:
         chart.dLbls = DataLabelList()
         chart.dLbls.showVal = True
-        chart.dLbls.showLegendKey = False
-        chart.dLbls.showCatName = False
-        chart.dLbls.showSerName = False
     except Exception:
         pass
-
-    # Rotação X
     if rotate_x_45:
         try:
             chart.x_axis.textRotation = 45
         except Exception:
             pass
-
-    # Cor sólida na série
     if solid_fill_hex:
         try:
             s = chart.series[0]
@@ -253,13 +234,10 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
 
 
 def _style_xl_pie_chart(chart: PieChart):
-    # Data labels (categoria + percentual)
     try:
         chart.dLbls = DataLabelList()
         chart.dLbls.showPercent = True
         chart.dLbls.showCatName = True
-        chart.dLbls.showLegendKey = False
-        chart.dLbls.showVal = False
     except Exception:
         pass
 
@@ -417,7 +395,7 @@ def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filt
 
 
 # =========================================================
-# Drilldown (estado)
+# Drilldown (estado) + Seleção para TABELA (barra clicada)
 # =========================================================
 def init_drill_state():
     if "drill_level" not in st.session_state:
@@ -427,11 +405,25 @@ def init_drill_state():
     if "drill_month" not in st.session_state:
         st.session_state.drill_month = None
 
+    # NOVO: foco da tabela (barra clicada)
+    if "table_focus_level" not in st.session_state:
+        st.session_state.table_focus_level = None  # "ANO"/"MES"/"SEMANA"
+    if "table_focus_value" not in st.session_state:
+        st.session_state.table_focus_value = None  # Ano(int) / Mês("Jan") / Semana("1ª")
+
 
 def reset_drill():
     st.session_state.drill_level = "AUTO"
     st.session_state.drill_year = None
     st.session_state.drill_month = None
+    # limpar também seleção da tabela
+    st.session_state.table_focus_level = None
+    st.session_state.table_focus_value = None
+
+
+def clear_table_focus():
+    st.session_state.table_focus_level = None
+    st.session_state.table_focus_value = None
 
 
 def resolve_initial_level(ano_sel: str, mes_sel: str):
@@ -450,6 +442,51 @@ def apply_drill_filters(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str) -
 
     if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
         dff = dff[dff[COL_DATA].dt.month == int(st.session_state.drill_month)]
+
+    return dff
+
+
+def apply_table_focus(df_context: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica o filtro da "barra clicada" para a tabela final.
+    Regra:
+      - Se estiver em nível ANO: filtra pelo ano clicado
+      - Se nível MES: filtra pelo mês clicado
+      - Se nível SEMANA: filtra pela semana do mês clicada
+    Observação:
+      - df_context já é (filtros + drill de ano/mês quando aplicável).
+    """
+    lvl = st.session_state.table_focus_level
+    val = st.session_state.table_focus_value
+    if not lvl or val is None:
+        return df_context
+
+    dff = df_context.copy()
+
+    if lvl == "ANO":
+        try:
+            y = int(val)
+            dff = dff[dff[COL_DATA].dt.year == y]
+        except Exception:
+            return df_context
+
+    elif lvl == "MES":
+        try:
+            m = INV_MESES_ABREV.get(str(val))
+            if m:
+                dff = dff[dff[COL_DATA].dt.month == int(m)]
+        except Exception:
+            return df_context
+
+    elif lvl == "SEMANA":
+        try:
+            s = str(val).replace("ª", "").strip()
+            w = int(s)
+            dff = dff.copy()
+            dff["_SEMANA_MES"] = semana_do_mes(dff[COL_DATA])
+            dff = dff[dff["_SEMANA_MES"] == w].drop(columns=["_SEMANA_MES"], errors="ignore")
+        except Exception:
+            return df_context
 
     return dff
 
@@ -545,11 +582,14 @@ def go_back_one_level(level_now: str, ano_sel: str, mes_sel: str):
     if level_now == "SEMANA" and mes_sel == "(Todos)" and st.session_state.drill_month is not None:
         st.session_state.drill_level = "MES"
         st.session_state.drill_month = None
+        # limpar foco de tabela ao voltar nível
+        clear_table_focus()
         return True
     if level_now == "MES" and ano_sel == "(Todos)" and st.session_state.drill_year is not None:
         st.session_state.drill_level = "ANO"
         st.session_state.drill_year = None
         st.session_state.drill_month = None
+        clear_table_focus()
         return True
     return False
 
@@ -645,7 +685,7 @@ def fig_ocorrencias(df_plot: pd.DataFrame, level: str):
         _common_bar_layout(fig, height=460)
         return fig
 
-    fig = px.bar(df_plot, x="Semana", y="Ocorrências", title="Ocorrências por semana do mês")
+    fig = px.bar(df_plot, x="Semana", y="Ocorrências", title="Ocorrências por semana do mês (clique para ver tabela da semana)")
     fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
     _apply_threshold_colors(fig, df_plot["Ocorrências"].tolist(), LIMIAR_OCORRENCIAS)
     _hide_yaxis(fig)
@@ -658,12 +698,11 @@ def fig_motivos(df_mot: pd.DataFrame, titulo: str):
     fig.update_traces(text=df_mot["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
     fig.update_layout(xaxis_tickangle=-45)
     _hide_yaxis(fig)
-    _common_bar_layout(fig, height=460)  # mesma dimensão do interativo
+    _common_bar_layout(fig, height=460)
     return fig
 
 
 def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
-    # pizza (participação) seguindo df_resp (que já segue seleção do interativo)
     fig = px.pie(df_resp, names="Responsável (análise)", values="Ocorrências", title=titulo, hole=0.35)
     fig.update_traces(textposition="inside", textinfo="percent+label")
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
@@ -697,24 +736,16 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     else:
         total_atras_rec = 0
 
-    # 1) dados para ocorrências por mês (para Excel manter padrão "mensal")
     dff_mes = dff.copy()
     dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
     g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
     df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
 
-    # 2) responsáveis (seleção do interativo)
     df_resp = calc_resp_analise(dff)
-
-    # 3) atrasadas (conforme filtro SEM drill)
     df_atras = calc_atrasadas_por_filtro(df_filtro_base)
-
-    # 4) motivos top 12 (seleção do interativo)
     df_mot = calc_motivos(dff, top_n=12)
 
     wb = Workbook()
-
-    # DASHBOARD
     ws = wb.active
     ws.title = "DASHBOARD"
     ws.sheet_view.showGridLines = False
@@ -747,7 +778,6 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     ws["E9"] = total_atras_rec; ws["E9"].font = Font(bold=True, size=14)
     ws["B10"] = "Obs.: tabelas base ficam na aba DADOS."; ws.merge_cells("B10:E10")
 
-    # DADOS
     wsd = wb.create_sheet("DADOS")
     wsd.sheet_view.showGridLines = True
     _set_col_widths(wsd, {"A": 2, "B": 34, "C": 22, "D": 34, "E": 22, "F": 2})
@@ -763,14 +793,13 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
 
     r = r2e + 3
-    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — recorte final (para Pizza)"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — recorte final (Pizza)"; wsd[f"B{r}"].font = Font(bold=True)
     r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_PIE", style="TableStyleMedium9")
 
     r = r3e + 3
     wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
     r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
 
-    # Destaque atrasadas > 0 (na tabela)
     try:
         rng = f"C{r4s+1}:C{r4e}"
         wsd.conditional_formatting.add(
@@ -779,35 +808,15 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     except Exception:
         pass
 
-    # Gráficos (estrutura igual ao painel: sem gridlines, sem rótulos eixo y, com rótulos de dados)
-    # Layout 2x2 na DASHBOARD:
-    # B12: Ocorrências por mês (azul)
-    # D12: Motivos top 12 (azul)
-    # B28: Pizza participação por responsável (pizza)
-    # D28: Atrasadas por responsável (vermelho)
+    _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12",
+                              rotate_x_45=False, height=7.2, width=12.5, solid_fill_hex=BLUE)
+    _add_bar_chart_from_sheet(wsd, ws, "Motivos (Top 12) — recorte", 2, 3, r2s, r2e, "D12",
+                              rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE)
+    _add_pie_chart_from_sheet(wsd, ws, "Participação por responsável (análise) — recorte", 2, 3, r3s, r3e, "B28",
+                              height=7.2, width=12.5)
+    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r4s, r4e, "D28",
+                              rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=RED)
 
-    _add_bar_chart_from_sheet(
-        wsd, ws,
-        "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12",
-        rotate_x_45=False, height=7.2, width=12.5, solid_fill_hex=BLUE
-    )
-    _add_bar_chart_from_sheet(
-        wsd, ws,
-        "Motivos (Top 12) — recorte", 2, 3, r2s, r2e, "D12",
-        rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE
-    )
-    _add_pie_chart_from_sheet(
-        wsd, ws,
-        "Participação por responsável (análise) — recorte", 2, 3, r3s, r3e, "B28",
-        height=7.2, width=12.5
-    )
-    _add_bar_chart_from_sheet(
-        wsd, ws,
-        "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r4s, r4e, "D28",
-        rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=RED
-    )
-
-    # RECORTE
     ws2 = wb.create_sheet("RECORTE")
     ws2.sheet_view.showGridLines = True
     _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — RECORTE FINAL (FILTRO + DRILL)")
@@ -860,7 +869,7 @@ require_login()
 init_drill_state()
 
 st.title(f"📊 {APP_NAME}")
-st.caption("Dashboard com filtros completos + exportação Excel/PDF + drilldown no gráfico Ocorrências + Pizza de participação por responsável.")
+st.caption("Dashboard com filtros completos + exportação Excel/PDF + drilldown no gráfico Ocorrências + Tabela por barra clicada.")
 
 with st.sidebar:
     st.header("📥 Entrada")
@@ -936,10 +945,16 @@ with tab1:
 
     df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
 
-    if can_go_back(level_now, ano_sel, mes_sel):
-        if st.button("⬅ Voltar (um nível)", help="Volta um nível no drill (Semana→Mês ou Mês→Ano)"):
-            if go_back_one_level(level_now, ano_sel, mes_sel):
-                st.rerun()
+    topbar1, topbar2 = st.columns([1, 3])
+    with topbar1:
+        if can_go_back(level_now, ano_sel, mes_sel):
+            if st.button("⬅ Voltar (um nível)", help="Volta um nível no drill (Semana→Mês ou Mês→Ano)"):
+                if go_back_one_level(level_now, ano_sel, mes_sel):
+                    st.rerun()
+    with topbar2:
+        if st.button("🧹 Limpar seleção da tabela", help="Volta a mostrar a tabela completa do recorte (filtros + drill)"):
+            clear_table_focus()
+            st.rerun()
 
     st.caption(f"📌 {breadcrumb}")
     fig_occ = fig_ocorrencias(df_occ_plot, level_now)
@@ -962,6 +977,11 @@ with tab1:
     if click_supported:
         clicked = get_clicked_x(occ_event)
         if clicked is not None:
+            # 1) Guarda a seleção para a TABELA (barra clicada)
+            st.session_state.table_focus_level = level_now
+            st.session_state.table_focus_value = clicked
+
+            # 2) Mantém o drill automático já existente (Ano->Mês, Mês->Semana)
             if level_now == "ANO" and ano_sel == "(Todos)":
                 try:
                     st.session_state.drill_year = int(clicked)
@@ -976,15 +996,16 @@ with tab1:
                     st.session_state.drill_month = int(mes_num)
                     st.session_state.drill_level = "SEMANA"
                     st.rerun()
+            else:
+                # Semana: apenas filtra a tabela (não muda drill)
+                st.rerun()
 
     # Base final (filtros + drill) para Motivos + Pizza
     df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
 
     df_mot_sel = calc_motivos(df_final, top_n=12)
     df_resp_sel = calc_resp_analise(df_final)  # usado na pizza (participação)
-
-    # Atrasadas por responsável conforme FILTRO (sem drill)
-    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
+    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)  # conforme filtro, sem drill
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
     fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
@@ -1005,9 +1026,16 @@ with tab1:
     with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
+    # ✅ TABELA: agora filtra pela barra clicada (quando existir seleção)
     if show_table:
-        st.subheader("Recorte final (tabela) — filtros + drill")
-        st.dataframe(df_final.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
+        df_table = apply_table_focus(df_final)
+
+        info_sel = ""
+        if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
+            info_sel = f" | Seleção: {st.session_state.table_focus_level}={st.session_state.table_focus_value}"
+        st.subheader(f"Recorte (tabela) — filtros + drill + barra clicada{info_sel}")
+
+        st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
 
 with tab2:
     if not total:
@@ -1023,7 +1051,7 @@ with tab2:
     if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
         drill_txt.append(f"Mês(clicado)={MESES_ABREV.get(int(st.session_state.drill_month), st.session_state.drill_month)}")
     if drill_txt:
-        filtro_txt = filtro_txt + " | Drill: " + " ; ".join(drill_txt)
+        filtro_txt = filtro_txt + " | Drill: " + " ; ".join(dril_txt) if False else (filtro_txt + " | Drill: " + " ; ".join(drill_txt))
 
     total_final = int(len(df_final_export))
     situ_final = df_final_export[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_final_export.columns and total_final) else pd.Series([], dtype=str)
@@ -1035,7 +1063,6 @@ with tab2:
 
     st.subheader("📄 PDF do Dashboard (1 página, 4 gráficos)")
     try:
-        # PDF 2x2: Ocorrências + Motivos + Pizza + Atrasadas
         df_occ_plot2, level_now2, _ = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
         fig1 = fig_ocorrencias(df_occ_plot2, level_now2)
 
