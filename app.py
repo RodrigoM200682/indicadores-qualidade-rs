@@ -1,7 +1,21 @@
 # app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
-# Atualização desta versão:
-# - Painel interativo (Ocorrências) agora aparece APENAS UMA VEZ e fica LADO A LADO com Motivos (Top 12)
-# - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Pizza e Atrasadas
+# - Login com senha única: QualidadeRS
+# - Dashboard moderno (Plotly) com drill Ano -> Mês -> Semana (clique na barra)
+# - Barras do gráfico interativo: verde (<=8) / vermelho (>8)
+# - Motivos (Top 12) acompanha a seleção do gráfico interativo (drill)
+# - Gráfico atrasadas por responsável: SEMPRE vermelho e baseado no filtro (Ano=2025 => só 2025; Ano=Todos => todos)
+# - Histograma (barras) de participação por responsável (análise) (substitui pizza) e segue seleção do gráfico interativo
+# - Tabela final mostra apenas as reclamações referentes à barra clicada
+# - Exportar: Resumo Excel (DASHBOARD 2x2 + DADOS + RECORTE) com gráficos sem grade e sem eixo Y
+# - Exportar: PDF do Dashboard (1 página, 2x2, colorido)
+#
+# Requisitos sugeridos (pinado para Streamlit Cloud):
+# streamlit
+# pandas
+# openpyxl
+# plotly==5.24.1
+# kaleido==0.2.1
+# reportlab
 
 import io
 import pandas as pd
@@ -14,7 +28,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from openpyxl.chart import BarChart, PieChart
+from openpyxl.chart import BarChart
 from openpyxl.chart.reference import Reference
 from openpyxl.chart.label import DataLabelList
 
@@ -24,14 +38,14 @@ from reportlab.lib.utils import ImageReader
 
 
 # =========================================================
-# APP
+# CONFIG
 # =========================================================
-APP_VERSION = "V22.02.26_T"
+APP_VERSION = "V18.02.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
 
-# Colunas esperadas (base Reclamações)
+# Colunas esperadas
 COL_CODIGO = "Código"
 COL_TITULO = "Título"
 COL_STATUS = "Status"
@@ -43,7 +57,6 @@ COL_RESP_ANALISE = "Responsável da análise de causa"
 COL_CATEGORIA = "Categoria"
 COL_SITUACAO = "Situação"  # ATRASADA / NO PRAZO
 
-# ✅ Filtros por marcar (com Categoria incluída)
 FILTROS_COLS = [
     "Status",
     "Categoria",
@@ -64,14 +77,14 @@ MESES_ABREV = {
 INV_MESES_ABREV = {v: k for k, v in MESES_ABREV.items()}
 
 # Regras de cores
-LIMIAR_OCORRENCIAS = 8  # <=8 verde, >8 vermelho
+LIMIAR_OCORRENCIAS = 8
 GREEN = "#2E7D32"
 RED = "#C62828"
 BLUE = "#1f77b4"
 
 
 # =========================================================
-# Login (senha fixa)
+# LOGIN
 # =========================================================
 def require_login():
     if "auth_ok" not in st.session_state:
@@ -95,7 +108,7 @@ def require_login():
 
 
 # =========================================================
-# Utilitários
+# UTIL
 # =========================================================
 def br_date_str(dt) -> str:
     if pd.isna(dt):
@@ -127,7 +140,7 @@ def semana_do_mes(dt_series: pd.Series) -> pd.Series:
 
 
 # =========================================================
-# Excel helpers
+# EXCEL HELPERS
 # =========================================================
 def _excel_theme():
     return {
@@ -203,6 +216,7 @@ def _hex_no_hash(hex_color: str) -> str:
 
 
 def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str | None):
+    # sem grid + sem eixo Y + rótulo de valor
     try:
         chart.y_axis.majorGridlines = None
         chart.y_axis.minorGridlines = None
@@ -210,20 +224,24 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
         chart.x_axis.minorGridlines = None
     except Exception:
         pass
+
     try:
         chart.y_axis.tickLblPos = "none"
     except Exception:
         pass
+
     try:
         chart.dLbls = DataLabelList()
         chart.dLbls.showVal = True
     except Exception:
         pass
+
     if rotate_x_45:
         try:
             chart.x_axis.textRotation = 45
         except Exception:
             pass
+
     if solid_fill_hex:
         try:
             s = chart.series[0]
@@ -231,15 +249,6 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
             s.graphicalProperties.line.solidFill = _hex_no_hash(solid_fill_hex)
         except Exception:
             pass
-
-
-def _style_xl_pie_chart(chart: PieChart):
-    try:
-        chart.dLbls = DataLabelList()
-        chart.dLbls.showPercent = True
-        chart.dLbls.showCatName = True
-    except Exception:
-        pass
 
 
 def _add_bar_chart_from_sheet(
@@ -266,27 +275,8 @@ def _add_bar_chart_from_sheet(
     target_ws.add_chart(chart, anchor_cell)
 
 
-def _add_pie_chart_from_sheet(
-    data_ws, target_ws,
-    title, cat_col, val_col, start_row, end_row, anchor_cell,
-    height=7.2, width=12.5
-):
-    chart = PieChart()
-    chart.title = title
-    chart.height = float(height)
-    chart.width = float(width)
-
-    data = Reference(data_ws, min_col=val_col, min_row=start_row, max_row=end_row)
-    cats = Reference(data_ws, min_col=cat_col, min_row=start_row + 1, max_row=end_row)
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(cats)
-
-    _style_xl_pie_chart(chart)
-    target_ws.add_chart(chart, anchor_cell)
-
-
 # =========================================================
-# PDF do Dashboard (1 página) — Plotly -> PNG via kaleido
+# PDF (Plotly -> PNG via kaleido)
 # =========================================================
 def build_dashboard_pdf_bytes(app_name: str, filtro_txt: str, kpis: dict, figs_plotly: list) -> bytes:
     img_bytes_list = []
@@ -345,7 +335,7 @@ def build_dashboard_pdf_bytes(app_name: str, filtro_txt: str, kpis: dict, figs_p
 
 
 # =========================================================
-# Carregamento e filtros
+# LOAD + FILTERS
 # =========================================================
 @st.cache_data(show_spinner=False)
 def carregar_df(upload_bytes: bytes, sheet_name: str) -> pd.DataFrame:
@@ -395,7 +385,7 @@ def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filt
 
 
 # =========================================================
-# Drilldown + seleção da tabela
+# DRILL STATE
 # =========================================================
 def init_drill_state():
     if "drill_level" not in st.session_state:
@@ -435,6 +425,7 @@ def resolve_initial_level(ano_sel: str, mes_sel: str):
 def apply_drill_filters(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str) -> pd.DataFrame:
     dff = df_filtrado.copy()
 
+    # Só aplica drill quando o filtro do topo está em "(Todos)"
     if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
         dff = dff[dff[COL_DATA].dt.year == int(st.session_state.drill_year)]
 
@@ -471,7 +462,6 @@ def apply_table_focus(df_context: pd.DataFrame) -> pd.DataFrame:
         try:
             s = str(val).replace("ª", "").strip()
             w = int(s)
-            dff = dff.copy()
             dff["_SEMANA_MES"] = semana_do_mes(dff[COL_DATA])
             dff = dff[dff["_SEMANA_MES"] == w].drop(columns=["_SEMANA_MES"], errors="ignore")
         except Exception:
@@ -583,7 +573,7 @@ def go_back_one_level(level_now: str, ano_sel: str, mes_sel: str):
 
 
 # =========================================================
-# Datasets (seguindo seleção)
+# DATASETS (seguem seleção do interativo)
 # =========================================================
 def calc_resp_analise(df_context: pd.DataFrame):
     resp = (
@@ -634,7 +624,7 @@ def calc_atrasadas_por_filtro(df_filtro_base: pd.DataFrame):
 
 
 # =========================================================
-# Plotly styling (sem eixo Y)
+# PLOTLY (sem eixo Y)
 # =========================================================
 def _hide_yaxis(fig):
     fig.update_yaxes(showticklabels=False, title=None, showgrid=True)
@@ -643,10 +633,7 @@ def _hide_yaxis(fig):
 
 
 def _common_bar_layout(fig, height=460):
-    fig.update_layout(
-        height=height,
-        margin=dict(l=10, r=10, t=55, b=10),
-    )
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=55, b=10))
     return fig
 
 
@@ -690,10 +677,15 @@ def fig_motivos(df_mot: pd.DataFrame, titulo: str):
     return fig
 
 
-def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
-    fig = px.pie(df_resp, names="Responsável (análise)", values="Ocorrências", title=titulo, hole=0.35)
-    fig.update_traces(textposition="inside", textinfo="percent+label")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
+def fig_hist_participacao(df_resp: pd.DataFrame, titulo: str):
+    # HISTOGRAMA (barras) — substitui pizza
+    if df_resp.empty:
+        df_resp = pd.DataFrame({"Responsável (análise)": ["SEM DADOS"], "Ocorrências": [0]})
+
+    fig = px.bar(df_resp, x="Responsável (análise)", y="Ocorrências", title=titulo)
+    fig.update_traces(text=df_resp["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
+    fig.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
+    fig.update_yaxes(showticklabels=False, title=None)
     return fig
 
 
@@ -708,8 +700,7 @@ def fig_atrasadas_vermelho(df_atras: pd.DataFrame, titulo: str):
 
 
 # =========================================================
-# Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza
-# (mesmo da sua versão anterior; mantido para não quebrar export)
+# EXPORT: EXCEL (2x2 + DADOS + RECORTE)
 # =========================================================
 def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd.DataFrame, titulo_filtro: str) -> bytes:
     dff = df_filtrado_final.copy()
@@ -725,16 +716,23 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     else:
         total_atras_rec = 0
 
+    # (A) Ocorrências por mês do recorte final
     dff_mes = dff.copy()
     dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
     g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
     df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
 
-    df_resp = calc_resp_analise(dff)
-    df_atras = calc_atrasadas_por_filtro(df_filtro_base)
+    # (B) Motivos top 12 do recorte final
     df_mot = calc_motivos(dff, top_n=12)
 
+    # (C) Histograma por responsável (análise) do recorte final
+    df_resp = calc_resp_analise(dff)
+
+    # (D) Atrasadas por responsável conforme filtro (sem drill)
+    df_atras = calc_atrasadas_por_filtro(df_filtro_base)
+
     wb = Workbook()
+
     ws = wb.active
     ws.title = "DASHBOARD"
     ws.sheet_view.showGridLines = False
@@ -767,6 +765,7 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     ws["E9"] = total_atras_rec; ws["E9"].font = Font(bold=True, size=14)
     ws["B10"] = "Obs.: tabelas base ficam na aba DADOS."; ws.merge_cells("B10:E10")
 
+    # DADOS
     wsd = wb.create_sheet("DADOS")
     wsd.sheet_view.showGridLines = True
     _set_col_widths(wsd, {"A": 2, "B": 34, "C": 22, "D": 34, "E": 22, "F": 2})
@@ -782,13 +781,14 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
 
     r = r2e + 3
-    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — recorte final (Pizza)"; wsd[f"B{r}"].font = Font(bold=True)
-    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_PIE", style="TableStyleMedium9")
+    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — Histograma (recorte final)"; wsd[f"B{r}"].font = Font(bold=True)
+    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_HIST", style="TableStyleMedium9")
 
     r = r3e + 3
-    wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro"; wsd[f"B{r}"].font = Font(bold=True)
     r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
 
+    # condicional atrasadas > 0 (col C)
     try:
         rng = f"C{r4s+1}:C{r4e}"
         wsd.conditional_formatting.add(
@@ -797,15 +797,17 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     except Exception:
         pass
 
+    # DASHBOARD 2x2 (grids off; y labels off; values on bars)
     _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12",
                               rotate_x_45=False, height=7.2, width=12.5, solid_fill_hex=BLUE)
     _add_bar_chart_from_sheet(wsd, ws, "Motivos (Top 12) — recorte", 2, 3, r2s, r2e, "D12",
                               rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE)
-    _add_pie_chart_from_sheet(wsd, ws, "Participação por responsável (análise) — recorte", 2, 3, r3s, r3e, "B28",
-                              height=7.2, width=12.5)
-    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r4s, r4e, "D28",
+    _add_bar_chart_from_sheet(wsd, ws, "Participação por responsável (análise) — Histograma", 2, 3, r3s, r3e, "B28",
+                              rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE)
+    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — filtro", 2, 3, r4s, r4e, "D28",
                               rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=RED)
 
+    # RECORTE (lista)
     ws2 = wb.create_sheet("RECORTE")
     ws2.sheet_view.showGridLines = True
     _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — RECORTE FINAL (FILTRO + DRILL)")
@@ -830,14 +832,14 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
 
 
 # =========================================================
-# UI Streamlit
+# STREAMLIT UI
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
 require_login()
 init_drill_state()
 
 st.title(f"📊 {APP_NAME}")
-st.caption("Painel interativo (Ocorrências) lado a lado com Motivos + Pizza + Atrasadas + Tabela por barra clicada.")
+st.caption("Ocorrências (interativo) + Motivos (Top 12) + Participação (Histograma) + Atrasadas + Exportações Excel/PDF.")
 
 with st.sidebar:
     st.header("📥 Entrada")
@@ -856,6 +858,7 @@ except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
 
+# filtros rápidos (topo)
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
 
@@ -877,6 +880,7 @@ with c5:
         reset_drill()
         st.rerun()
 
+# filtros por marcar
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
@@ -891,6 +895,7 @@ with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
 
 df_filtrado = aplicar_filtros(df_base, ano_sel, mes_sel, resp_occ_sel, multi_filters)
 
+# KPIs
 total = int(len(df_filtrado))
 situ = df_filtrado[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_filtrado.columns and total) else pd.Series([], dtype=str)
 atras = int((situ == "ATRASADA").sum()) if total else 0
@@ -911,22 +916,22 @@ with tab1:
         st.warning("Sem registros no filtro atual.")
         st.stop()
 
-    # Ocorrências (dataset + figura)
+    # gráfico interativo (ocorrências)
     df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
     fig_occ = fig_ocorrencias(df_occ_plot, level_now)
 
-    # Base final (filtros + drill) para Motivos + Pizza
+    # seleção do interativo (drill) afeta estes:
     df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
     df_mot_sel = calc_motivos(df_final, top_n=12)
-    df_resp_sel = calc_resp_analise(df_final)
-    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
+    df_resp_sel = calc_resp_analise(df_final)        # histograma
+    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)  # conforme filtro do topo
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
-    fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+    fig_hist = fig_hist_participacao(df_resp_sel, "Participação por responsável (análise) — Histograma (seleção do gráfico Ocorrências)")
     titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
     fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
-    # Barra superior (controles drill/tabela)
+    # controles drill
     topbar1, topbar2, topbar3 = st.columns([1.2, 1.4, 3.4])
     with topbar1:
         if can_go_back(level_now, ano_sel, mes_sel):
@@ -940,7 +945,7 @@ with tab1:
     with topbar3:
         st.caption(f"📌 {breadcrumb}")
 
-    # ✅ Linha 1: INTERATIVO (Ocorrências) lado a lado com Motivos
+    # LINHA 1: Ocorrências (interativo) lado a lado com Motivos
     colL, colR = st.columns(2)
 
     with colL:
@@ -961,7 +966,7 @@ with tab1:
         if click_supported:
             clicked = get_clicked_x(occ_event)
             if clicked is not None:
-                # seleção para tabela
+                # tabela por barra clicada
                 st.session_state.table_focus_level = level_now
                 st.session_state.table_focus_value = clicked
 
@@ -986,14 +991,14 @@ with tab1:
     with colR:
         st.plotly_chart(fig_mot, use_container_width=True)
 
-    # Linha 2: Pizza + Atrasadas
+    # LINHA 2: Histograma (participação) + Atrasadas
     row2_left, row2_right = st.columns(2)
     with row2_left:
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_hist, use_container_width=True)
     with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
-    # Tabela final (barra clicada)
+    # tabela final: somente a barra clicada (em cima do drill)
     if show_table:
         df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
         df_table = apply_table_focus(df_table_base)
@@ -1001,6 +1006,7 @@ with tab1:
         info_sel = ""
         if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
             info_sel = f" | Seleção: {st.session_state.table_focus_level}={st.session_state.table_focus_value}"
+
         st.subheader(f"Recorte (tabela) — filtros + drill + barra clicada{info_sel}")
         st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
 
@@ -1009,6 +1015,7 @@ with tab2:
         st.info("Quando houver registros no filtro, as exportações ficam disponíveis.")
         st.stop()
 
+    # exportações seguem o drill atual
     df_final_export = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
 
     filtro_txt = _titulo_filtro(ano_sel, mes_sel, resp_occ_sel)
@@ -1039,7 +1046,7 @@ with tab2:
 
         titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
         fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
-        fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+        fig3 = fig_hist_participacao(df_resp_pdf, "Participação por responsável (análise) — Histograma")
         fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
@@ -1060,7 +1067,7 @@ with tab2:
         st.caption("Se citar kaleido/Chrome, mantenha plotly==5.24.1 e kaleido==0.2.1 no requirements.txt")
 
     st.divider()
-    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza")
+    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE) — Histograma")
 
     titulo_filtro = f"Reclamações — Filtro atual | {filtro_txt}"
     resumo_bytes = build_resumo_excel_bytes(df_final_export, df_filtrado, titulo_filtro)
