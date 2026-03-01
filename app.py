@@ -1,4 +1,4 @@
-# app.py — INDICADORES QUALIDADE RS (WEB) — V01.03.26
+# app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
 # Atualização desta versão:
 # - Painel interativo (Ocorrências) agora aparece APENAS UMA VEZ e fica LADO A LADO com Motivos (Top 12)
 # - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Pizza e Atrasadas
@@ -31,7 +31,7 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V01.03.26_T"
+APP_VERSION = "V22.02.26_T"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -751,11 +751,16 @@ def fig_motivos(df_mot: pd.DataFrame, titulo: str):
     return fig
 
 
-def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
-    fig = px.pie(df_resp, names="Responsável (análise)", values="Ocorrências", title=titulo, hole=0.35)
-    fig.update_traces(textposition="inside", textinfo="percent+label")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
+def fig_bar_participacao(df_resp: pd.DataFrame, titulo: str):
+    """Participação por responsável (análise de causa) em barras (substitui pizza)."""
+    fig = px.bar(df_resp, x="Responsável (análise)", y="Ocorrências", title=titulo)
+    fig.update_traces(text=df_resp["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
+    fig.update_layout(xaxis_tickangle=-45)
+    _hide_yaxis(fig)
+    _common_bar_layout(fig, height=420)
     return fig
+
+
 
 
 def fig_atrasadas_vermelho(df_atras: pd.DataFrame, titulo: str):
@@ -936,6 +941,13 @@ if up is not None:
     try:
         source_bytes = up.getvalue()
         source_meta = save_uploaded_excel(source_bytes, up.name, sheet)
+        # Novo arquivo enviado: reinicia estado (evita manter drill/consulta antiga)
+        st.session_state._restored_from_disk = True
+        st.session_state.drill_level = "AUTO"
+        st.session_state.drill_year = None
+        st.session_state.drill_month = None
+        st.session_state.table_focus_level = None
+        st.session_state.table_focus_value = None
     except Exception as e:
         st.error(f"Não consegui salvar a planilha enviada. Detalhe: {e}")
         st.stop()
@@ -981,21 +993,24 @@ def _default_multisel(all_options, saved_list):
     return out if out else all_options
 
 
-# Restaura estado do drill/tabela da última consulta (se existir)
-try:
-    if isinstance(_last_consulta, dict):
-        if _last_consulta.get("drill_level") in ("AUTO", "ANO", "MES", "SEMANA"):
-            st.session_state.drill_level = _last_consulta.get("drill_level")
-        if _last_consulta.get("drill_year") is not None:
-            st.session_state.drill_year = _last_consulta.get("drill_year")
-        if _last_consulta.get("drill_month") is not None:
-            st.session_state.drill_month = _last_consulta.get("drill_month")
-        if _last_consulta.get("table_focus_level") is not None:
-            st.session_state.table_focus_level = _last_consulta.get("table_focus_level")
-        if _last_consulta.get("table_focus_value") is not None:
-            st.session_state.table_focus_value = _last_consulta.get("table_focus_value")
-except Exception:
-    pass
+# Restaura estado do drill/tabela da última consulta (se existir) — somente 1x por sessão
+if not st.session_state.get("_restored_from_disk", False):
+    try:
+        if isinstance(_last_consulta, dict):
+            if _last_consulta.get("drill_level") in ("AUTO", "ANO", "MES", "SEMANA"):
+                st.session_state.drill_level = _last_consulta.get("drill_level")
+            if _last_consulta.get("drill_year") is not None:
+                st.session_state.drill_year = _last_consulta.get("drill_year")
+            if _last_consulta.get("drill_month") is not None:
+                st.session_state.drill_month = _last_consulta.get("drill_month")
+            if _last_consulta.get("table_focus_level") is not None:
+                st.session_state.table_focus_level = _last_consulta.get("table_focus_level")
+            if _last_consulta.get("table_focus_value") is not None:
+                st.session_state.table_focus_value = _last_consulta.get("table_focus_value")
+    except Exception:
+        pass
+    st.session_state._restored_from_disk = True
+
 
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
@@ -1096,7 +1111,7 @@ with tab1:
     df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
-    fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+    fig_pie = fig_bar_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
     titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
     fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
@@ -1149,8 +1164,24 @@ with tab1:
                     except Exception:
                         pass
                 elif level_now == "MES" and mes_sel == "(Todos)":
-                    mes_num = INV_MESES_ABREV.get(str(clicked))
+                    _ck = str(clicked)
+                    # Aceita 'Jan', 'Jan/2026', 'Jan-2026', '2026-01', etc.
+                    mes_num = None
+                    if _ck in INV_MESES_ABREV:
+                        mes_num = INV_MESES_ABREV.get(_ck)
+                    else:
+                        # tenta pegar as 3 primeiras letras (Jan/2026)
+                        _abbr = _ck.strip()[:3].title()
+                        mes_num = INV_MESES_ABREV.get(_abbr)
+                        if mes_num is None:
+                            # tenta formato YYYY-MM ou YYYY/MM
+                            try:
+                                if len(_ck) >= 7 and _ck[4] in ("-", "/"):
+                                    mes_num = int(_ck[5:7])
+                            except Exception:
+                                mes_num = None
                     if mes_num:
+
                         st.session_state.drill_month = int(mes_num)
                         st.session_state.drill_level = "SEMANA"
                         st.rerun()
@@ -1213,7 +1244,7 @@ with tab2:
 
         titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
         fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
-        fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+        fig3 = fig_bar_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
         fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
