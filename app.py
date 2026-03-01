@@ -1223,33 +1223,46 @@ with tab1:
 
         xlsx_bytes = df_to_xlsx_bytes(df_table, sheet_name="Recorte")
 
+        title_recorte = f"Ocorrências do recorte — {info_sel or 'seleção'}"
+
+        def _render_recorte_table():
+            st.caption("Mostro abaixo **todas as colunas** do recorte (filtros + drill + barra clicada).")
+            st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
+            st.download_button(
+                "⬇️ Baixar recorte em Excel",
+                data=xlsx_bytes,
+                file_name="recorte_ocorrencias.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            if st.button("Fechar", key="fechar_recorte_dialog"):
+                st.session_state.show_table_dialog = False
+                st.rerun()
+
+        _opened_as_dialog = False
+
+        # Streamlit >= 1.32 (st.dialog) – mas algumas versões expõem a função sem suportar "with"
         if hasattr(st, "dialog"):
-            with st.dialog(f"Ocorrências do recorte — {info_sel or 'seleção'}"):
-                st.caption("Mostro abaixo **todas as colunas** do recorte (filtros + drill + barra clicada).")
-                st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
-                st.download_button(
-                    "⬇️ Baixar recorte em Excel",
-                    data=xlsx_bytes,
-                    file_name="recorte_ocorrencias.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                if st.button("Fechar"):
-                    st.session_state.show_table_dialog = False
-                    st.rerun()
-        else:
-            # fallback para versões antigas do Streamlit
-            with st.expander(f"Ocorrências do recorte — {info_sel or 'seleção'}", expanded=True):
-                st.caption("Seu Streamlit não suporta dialog; uso este painel expansível como alternativa.")
-                st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
-                st.download_button(
-                    "⬇️ Baixar recorte em Excel",
-                    data=xlsx_bytes,
-                    file_name="recorte_ocorrencias.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                if st.button("Fechar recorte"):
-                    st.session_state.show_table_dialog = False
-                    st.rerun()
+            try:
+                with st.dialog(title_recorte):
+                    _render_recorte_table()
+                _opened_as_dialog = True
+            except Exception:
+                _opened_as_dialog = False
+
+        # Streamlit mais antigo (experimental_dialog)
+        if (not _opened_as_dialog) and hasattr(st, "experimental_dialog"):
+            try:
+                with st.experimental_dialog(title_recorte):
+                    _render_recorte_table()
+                _opened_as_dialog = True
+            except Exception:
+                _opened_as_dialog = False
+
+        # Fallback universal (sempre funciona)
+        if not _opened_as_dialog:
+            with st.expander(title_recorte, expanded=True):
+                st.caption("⚠️ Seu Streamlit não suportou dialog/modal; uso este painel expansível como alternativa.")
+                _render_recorte_table()
 
 # Tabela final (barra clicada)
     if show_table:
