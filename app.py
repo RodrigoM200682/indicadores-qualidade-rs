@@ -5,10 +5,8 @@
 
 import io
 import os
+import re
 import json
-from datetime import datetime
-from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -31,76 +29,12 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V01.03.26"
+APP_VERSION = "V22.02.26_T"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
-# =========================================================
-# Persistência (última planilha + última consulta)
-# =========================================================
-DATA_DIR = Path("data_store")
-META_FILE = DATA_DIR / "last_state.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-def _now_str():
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-def _safe_filename(name: str) -> str:
-    name = (name or "dados.xlsx").strip().replace("\\", "_").replace("/", "_")
-    return "".join(ch for ch in name if ch.isalnum() or ch in (" ", "_", "-", ".", "(", ")")).strip()
-
-def save_uploaded_excel(file_bytes: bytes, original_name: str, sheet_name: str):
-    """Salva o Excel enviado e atualiza o ponteiro da 'última planilha'."""
-    fname = _safe_filename(original_name)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stored_name = f"{stamp}__{fname}"
-    stored_path = DATA_DIR / stored_name
-    stored_path.write_bytes(file_bytes)
-
-    meta = {
-        "last_file_path": str(stored_path),
-        "original_name": fname,
-        "loaded_at": _now_str(),
-        "sheet_name": sheet_name,
-        "consulta": {},
-    }
-    META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    return meta
-
-def load_last_excel():
-    """Carrega bytes e metadados do último Excel salvo (se existir)."""
-    if not META_FILE.exists():
-        return None, None
-    try:
-        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-        p = Path(meta.get("last_file_path", ""))
-        if p.exists():
-            return p.read_bytes(), meta
-    except Exception:
-        return None, None
-    return None, None
-
-def save_last_consulta(cons: dict):
-    """Atualiza somente a parte de 'consulta' no JSON."""
-    if not META_FILE.exists():
-        return
-    try:
-        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        meta = {}
-    meta["consulta"] = cons or {}
-    meta["consulta_saved_at"] = _now_str()
-    META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # Colunas esperadas (base Reclamações)
-
-def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Dados") -> bytes:
-    """Converte um DataFrame em XLSX (bytes) para download."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    return output.getvalue()
-
 COL_CODIGO = "Código"
 COL_TITULO = "Título"
 COL_STATUS = "Status"
@@ -478,9 +412,6 @@ def init_drill_state():
         st.session_state.table_focus_level = None  # "ANO"/"MES"/"SEMANA"
     if "table_focus_value" not in st.session_state:
         st.session_state.table_focus_value = None
-    if "show_table_dialog" not in st.session_state:
-        st.session_state.show_table_dialog = False
-
 
 
 def reset_drill():
@@ -489,13 +420,11 @@ def reset_drill():
     st.session_state.drill_month = None
     st.session_state.table_focus_level = None
     st.session_state.table_focus_value = None
-    st.session_state.show_table_dialog = False
 
 
 def clear_table_focus():
     st.session_state.table_focus_level = None
     st.session_state.table_focus_value = None
-    st.session_state.show_table_dialog = False
 
 
 def resolve_initial_level(ano_sel: str, mes_sel: str):
@@ -764,16 +693,19 @@ def fig_motivos(df_mot: pd.DataFrame, titulo: str):
     return fig
 
 
-def fig_bar_participacao(df_resp: pd.DataFrame, titulo: str):
-    """Participação por responsável (análise de causa) em barras (substitui pizza)."""
-    fig = px.bar(df_resp, x="Responsável (análise)", y="Ocorrências", title=titulo)
-    fig.update_traces(text=df_resp["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
+def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
+    """Gráfico de participação por responsável (análise) em BARRAS (substitui pizza)."""
+    ycol = df_resp["Ocorrências"] if "Ocorrências" in df_resp.columns else df_resp.iloc[:, 1]
+    fig = px.bar(df_resp, x="Responsável (análise)", y=ycol.name if hasattr(ycol,'name') and ycol.name else "Ocorrências", title=titulo)
+    # rótulos e layout
+    try:
+        fig.update_traces(text=df_resp[ycol.name if hasattr(ycol,'name') and ycol.name else "Ocorrências"], textposition="outside", cliponaxis=False)
+    except Exception:
+        pass
     fig.update_layout(xaxis_tickangle=-45)
     _hide_yaxis(fig)
-    _common_bar_layout(fig, height=420)
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10))
     return fig
-
-
 
 
 def fig_atrasadas_vermelho(df_atras: pd.DataFrame, titulo: str):
@@ -909,6 +841,78 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
 
 
 # =========================================================
+# Persistência local (Streamlit Cloud / runtime)
+# - Guarda a última planilha enviada e a última consulta.
+# Observação: no Streamlit Cloud o disco é efêmero; em reinícios/redeploys os arquivos podem ser perdidos.
+# =========================================================
+DATA_STORE_DIR = os.path.join(os.path.dirname(__file__), "data_store")
+LAST_META_PATH = os.path.join(DATA_STORE_DIR, "last_state.json")
+
+def _ensure_data_store():
+    os.makedirs(DATA_STORE_DIR, exist_ok=True)
+
+def _now_iso():
+    return pd.Timestamp.now(tz=None).strftime("%Y-%m-%d %H:%M:%S")
+
+def save_uploaded_excel(file_bytes: bytes, original_name: str, sheet: str):
+    _ensure_data_store()
+    ts = pd.Timestamp.now(tz=None).strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", (original_name or "dados.xlsx"))
+    saved_name = f"{ts}__{safe_name}"
+    saved_path = os.path.join(DATA_STORE_DIR, saved_name)
+    with open(saved_path, "wb") as f:
+        f.write(file_bytes)
+
+    meta = {
+        "last_excel_path": saved_path,
+        "original_name": original_name,
+        "saved_name": saved_name,
+        "loaded_at": _now_iso(),
+        "sheet": sheet,
+        "last_query": {},
+    }
+    with open(LAST_META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+def load_last_meta():
+    try:
+        with open(LAST_META_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def load_last_excel_bytes():
+    meta = load_last_meta()
+    if not meta:
+        return None, None
+    p = meta.get("last_excel_path")
+    if not p or not os.path.exists(p):
+        return None, meta
+    with open(p, "rb") as f:
+        return f.read(), meta
+
+def save_last_query(state: dict):
+    meta = load_last_meta() or {}
+    meta["last_query"] = state or {}
+    if "loaded_at" not in meta:
+        meta["loaded_at"] = _now_iso()
+    _ensure_data_store()
+    with open(LAST_META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def get_last_query():
+    meta = load_last_meta() or {}
+    return meta.get("last_query") or {}
+
+def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "RECORTE") -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    out.seek(0)
+    return out.read()
+
+# =========================================================
 # UI Streamlit
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
@@ -921,132 +925,86 @@ st.caption("Painel interativo (Ocorrências) lado a lado com Motivos + Pizza + A
 with st.sidebar:
     st.header("📥 Entrada")
 
-    # Carrega referência da última planilha (se existir)
-    last_bytes, last_meta = load_last_excel()
+    # Upload manual (prioridade)
+    up = st.file_uploader("Envie o Excel (ex.: Consultas_RNC.xlsx)", type=["xlsx", "xlsm", "xls"])
+    sheet = st.text_input("Nome da aba (sheet)", value=DEFAULT_SHEET)
 
-    if last_meta:
-        st.success("Última planilha encontrada ✅")
-        st.write(f"**Arquivo:** {last_meta.get('original_name','-')}")
-        st.write(f"**Carregado em:** {last_meta.get('loaded_at','-')}")
-        st.write(f"**Aba (sheet):** {last_meta.get('sheet_name', DEFAULT_SHEET)}")
-        if st.button("🧹 Esquecer última planilha"):
-            try:
-                META_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
-            st.rerun()
-        st.divider()
+    # Último arquivo salvo (se existir)
+    last_bytes, last_meta = load_last_excel_bytes()
+    use_last = False
+    if (up is None) and (last_bytes is not None):
+        use_last = st.checkbox("Usar automaticamente a última planilha salva", value=True)
+        if use_last and last_meta:
+            st.caption(f"Última planilha: **{last_meta.get('original_name','-')}** | carregada em **{last_meta.get('loaded_at','-')}**")
 
-    up = st.file_uploader("Enviar nova planilha (substitui a última)", type=["xlsx", "xlsm", "xls"])
-    sheet = st.text_input(
-        "Nome da aba (sheet)",
-        value=(last_meta.get("sheet_name") if last_meta else DEFAULT_SHEET),
-        help="Se a sua planilha usa outra aba, ajuste aqui.",
-    )
     st.divider()
     st.caption("Senha do app: QualidadeRS")
 
-# Define fonte de dados:
-source_bytes = None
-source_meta = None
+# Fonte de dados: upload > último salvo
+excel_bytes = None
+meta_loaded = None
 
 if up is not None:
-    try:
-        source_bytes = up.getvalue()
-        source_meta = save_uploaded_excel(source_bytes, up.name, sheet)
-        # Novo arquivo enviado: reinicia estado (evita manter drill/consulta antiga)
-        st.session_state._restored_from_disk = True
-        st.session_state.drill_level = "AUTO"
-        st.session_state.drill_year = None
-        st.session_state.drill_month = None
-        st.session_state.table_focus_level = None
-        st.session_state.table_focus_value = None
-    except Exception as e:
-        st.error(f"Não consegui salvar a planilha enviada. Detalhe: {e}")
-        st.stop()
-else:
-    # Sem upload: usa automaticamente a última planilha salva
-    if last_bytes is not None:
-        source_bytes = last_bytes
-        source_meta = last_meta
+    excel_bytes = up.getvalue()
+    meta_loaded = save_uploaded_excel(excel_bytes, getattr(up, "name", "dados.xlsx"), sheet)
+elif (last_bytes is not None) and use_last:
+    excel_bytes = last_bytes
+    meta_loaded = last_meta
 
-if source_bytes is None:
-    st.info("Envie uma planilha (primeira vez) — depois o app abre sempre com a última planilha salva.")
+if excel_bytes is None:
+    st.info("Envie o arquivo Excel para começar (ou habilite 'usar a última planilha salva' se já houver uma).")
     st.stop()
 
 try:
-    df_base = carregar_df(source_bytes, sheet)
+    df_base = carregar_df(excel_bytes, sheet)
 except Exception as e:
     st.error(f"Erro ao carregar: {e}")
-    st.stop()
+    
+# Cabeçalho: data dos dados / período do arquivo
+p_min = br_date_str(df_base[COL_DATA].min()) if len(df_base) else "-"
+p_max = br_date_str(df_base[COL_DATA].max()) if len(df_base) else "-"
+if meta_loaded:
+    st.info(f"📅 Dados: **{meta_loaded.get('original_name','-')}** | carregado em **{meta_loaded.get('loaded_at','-')}** | período no arquivo: **{p_min}** a **{p_max}**")
+else:
+    st.info(f"📅 Período no arquivo: **{p_min}** a **{p_max}**")
 
-# =========================================================
-# Recupera última consulta (filtros) — se existir
-# =========================================================
-_last_consulta = {}
-try:
-    if isinstance(source_meta, dict):
-        _last_consulta = source_meta.get("consulta") or {}
-except Exception:
-    _last_consulta = {}
-
-def _pick_select_index(options, saved_value, default_index=0):
-    try:
-        if saved_value in options:
-            return options.index(saved_value)
-    except Exception:
-        pass
-    return default_index
-
-def _default_multisel(all_options, saved_list):
-    if not saved_list:
-        return all_options  # padrão: tudo selecionado
-    s = set(str(x) for x in saved_list)
-    out = [v for v in all_options if str(v) in s]
-    return out if out else all_options
-
-
-# Restaura estado do drill/tabela da última consulta (se existir) — somente 1x por sessão
-if not st.session_state.get("_restored_from_disk", False):
-    try:
-        if isinstance(_last_consulta, dict):
-            if _last_consulta.get("drill_level") in ("AUTO", "ANO", "MES", "SEMANA"):
-                st.session_state.drill_level = _last_consulta.get("drill_level")
-            if _last_consulta.get("drill_year") is not None:
-                st.session_state.drill_year = _last_consulta.get("drill_year")
-            if _last_consulta.get("drill_month") is not None:
-                st.session_state.drill_month = _last_consulta.get("drill_month")
-            if _last_consulta.get("table_focus_level") is not None:
-                st.session_state.table_focus_level = _last_consulta.get("table_focus_level")
-            if _last_consulta.get("table_focus_value") is not None:
-                st.session_state.table_focus_value = _last_consulta.get("table_focus_value")
-    except Exception:
-        pass
-    st.session_state._restored_from_disk = True
-
+st.stop()
 
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
+
+last_q = get_last_query()
+
+def _ss_init(k, v):
+    if (k not in st.session_state) and (v is not None):
+        st.session_state[k] = v
+
+# restaura seleções principais (apenas 1x por sessão)
+if "_restored_last_query" not in st.session_state:
+    st.session_state["_restored_last_query"] = True
+    _ss_init("ano_sel", last_q.get("ano_sel"))
+    _ss_init("mes_sel", last_q.get("mes_sel"))
+    _ss_init("resp_occ_sel", last_q.get("resp_occ_sel"))
+    # drill + recorte
+    for k in ["drill_level","drill_year","drill_month","table_focus_level","table_focus_value"]:
+        _ss_init(k, last_q.get(k))
+    # filtros por marcar
+    _ss_init("filtros_sel", last_q.get("filtros_sel", {}))
+
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
 
 with c1:
-    _ano_opts = ["(Todos)"] + [str(a) for a in anos]
-    _ano_saved = (_last_consulta.get("ano_sel") if isinstance(_last_consulta, dict) else None)
-    ano_sel = st.selectbox("Ano", _ano_opts, index=_pick_select_index(_ano_opts, _ano_saved, default_index=0))
+    ano_sel = st.selectbox("Ano", ["(Todos)"] + [str(a) for a in anos], index=0, key="ano_sel")
 with c2:
-    _mes_opts = ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)]
-    _mes_saved = (_last_consulta.get("mes_sel") if isinstance(_last_consulta, dict) else None)
-    mes_sel = st.selectbox("Mês", _mes_opts, index=_pick_select_index(_mes_opts, _mes_saved, default_index=0))
+    mes_sel = st.selectbox("Mês", ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0, key="mes_sel")
 with c3:
     if COL_RESP_OCORRENCIA in df_base.columns:
         resp_vals = sorted(df_base[COL_RESP_OCORRENCIA].dropna().astype(str).replace("nan", "").unique().tolist())
         resp_vals = [v for v in resp_vals if v != ""]
     else:
         resp_vals = []
-    _resp_opts = ["(Todos)"] + resp_vals
-_resp_saved = (_last_consulta.get("resp_occ_sel") if isinstance(_last_consulta, dict) else None)
-resp_occ_sel = st.selectbox("Resp. ocorrência", _resp_opts, index=_pick_select_index(_resp_opts, _resp_saved, default_index=0))
+    resp_occ_sel = st.selectbox("Resp. ocorrência", ["(Todos)"] + resp_vals, index=0, key="resp_occ_sel")
 with c4:
-    show_table = st.toggle("Mostrar tabela", value=bool((_last_consulta.get("show_table") if isinstance(_last_consulta, dict) else True)))
+    show_table = st.toggle("Mostrar tabela", value=True, key="show_table")
 with c5:
     if st.button("🔄 Reset drill"):
         reset_drill()
@@ -1055,35 +1013,31 @@ with c5:
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
+
+    # filtros persistidos (última consulta)
+    filtros_saved = st.session_state.get("filtros_sel", {}) or {}
+
     for i, col in enumerate(FILTROS_COLS):
         if col not in df_base.columns:
             continue
         vals = sorted(df_base[col].dropna().astype(str).replace("nan", "").unique().tolist())
         vals = [v for v in vals if v != ""]
+
+        # default = último valor salvo (se ainda existir), senão todos
+        default_vals = filtros_saved.get(col)
+        if isinstance(default_vals, list):
+            default_vals = [v for v in default_vals if v in vals]
+        if not default_vals:
+            default_vals = vals
+
         with cols[i % 4]:
-            sel = st.multiselect(col, options=vals, default=_default_multisel(vals, (_last_consulta.get(col) if isinstance(_last_consulta, dict) else None)))
+            sel = st.multiselect(col, options=vals, default=default_vals, key=f"flt__{col}")
         multi_filters[col] = sel
 
+    # guarda em memória para salvar no disco no final do run
+    st.session_state["filtros_sel"] = {k: list(v) for k, v in multi_filters.items()}
+
 df_filtrado = aplicar_filtros(df_base, ano_sel, mes_sel, resp_occ_sel, multi_filters)
-# Salva a última consulta (para reabrir o app já com a mesma seleção)
-try:
-    _cons_to_save = {
-        "ano_sel": ano_sel,
-        "mes_sel": mes_sel,
-        "resp_occ_sel": resp_occ_sel,
-        "show_table": bool(show_table),
-        # multi-filtros (colunas do expander)
-        **{k: v for k, v in (multi_filters or {}).items()},
-        # estado do drill (para voltar exatamente onde estava)
-        "drill_level": st.session_state.get("drill_level"),
-        "drill_year": st.session_state.get("drill_year"),
-        "drill_month": st.session_state.get("drill_month"),
-        "table_focus_level": st.session_state.get("table_focus_level"),
-        "table_focus_value": st.session_state.get("table_focus_value"),
-    }
-    save_last_consulta(_cons_to_save)
-except Exception:
-    pass
 
 total = int(len(df_filtrado))
 situ = df_filtrado[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_filtrado.columns and total) else pd.Series([], dtype=str)
@@ -1096,14 +1050,6 @@ k1.metric("Total ocorrências", total)
 k2.metric("Em atraso (filtro)", atras)
 k3.metric("Período", f"{p_ini} → {p_fim}")
 k4.metric("Versão", APP_VERSION)
-
-# Informação da base carregada (arquivo + data/hora + período dos dados)
-try:
-    _orig_name = (source_meta.get("original_name") if isinstance(source_meta, dict) else None) or "-"
-    _loaded_at = (source_meta.get("loaded_at") if isinstance(source_meta, dict) else None) or "-"
-    st.caption(f"📌 Base atual: **{_orig_name}** | Carregada em: **{_loaded_at}** | Período dos dados (filtro): **{p_ini} → {p_fim}**")
-except Exception:
-    pass
 
 st.divider()
 tab1, tab2 = st.tabs(["📈 Dashboard", "📦 Exportações (Excel/PDF)"])
@@ -1124,7 +1070,7 @@ with tab1:
     df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
-    fig_pie = fig_bar_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+    fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
     titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
     fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
@@ -1166,7 +1112,6 @@ with tab1:
                 # seleção para tabela
                 st.session_state.table_focus_level = level_now
                 st.session_state.table_focus_value = clicked
-                st.session_state.show_table_dialog = True
 
                 # drill
                 if level_now == "ANO" and ano_sel == "(Todos)":
@@ -1178,24 +1123,8 @@ with tab1:
                     except Exception:
                         pass
                 elif level_now == "MES" and mes_sel == "(Todos)":
-                    _ck = str(clicked)
-                    # Aceita 'Jan', 'Jan/2026', 'Jan-2026', '2026-01', etc.
-                    mes_num = None
-                    if _ck in INV_MESES_ABREV:
-                        mes_num = INV_MESES_ABREV.get(_ck)
-                    else:
-                        # tenta pegar as 3 primeiras letras (Jan/2026)
-                        _abbr = _ck.strip()[:3].title()
-                        mes_num = INV_MESES_ABREV.get(_abbr)
-                        if mes_num is None:
-                            # tenta formato YYYY-MM ou YYYY/MM
-                            try:
-                                if len(_ck) >= 7 and _ck[4] in ("-", "/"):
-                                    mes_num = int(_ck[5:7])
-                            except Exception:
-                                mes_num = None
+                    mes_num = INV_MESES_ABREV.get(str(clicked))
                     if mes_num:
-
                         st.session_state.drill_month = int(mes_num)
                         st.session_state.drill_level = "SEMANA"
                         st.rerun()
@@ -1212,71 +1141,31 @@ with tab1:
     with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
-        # ✅ Janela (dialog) com as ocorrências da barra clicada no gráfico interativo
-    if st.session_state.get("show_table_dialog", False) and st.session_state.get("table_focus_value") is not None:
-        df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
-        df_table = apply_table_focus(df_table_base)
-
-        info_sel = ""
-        if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
-            info_sel = f"{st.session_state.table_focus_level}={st.session_state.table_focus_value}"
-
-        xlsx_bytes = df_to_xlsx_bytes(df_table, sheet_name="Recorte")
-
-        title_recorte = f"Ocorrências do recorte — {info_sel or 'seleção'}"
-
-        def _render_recorte_table():
-            st.caption("Mostro abaixo **todas as colunas** do recorte (filtros + drill + barra clicada).")
-            st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
-            st.download_button(
-                "⬇️ Baixar recorte em Excel",
-                data=xlsx_bytes,
-                file_name="recorte_ocorrencias.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            if st.button("Fechar", key="fechar_recorte_dialog"):
-                st.session_state.show_table_dialog = False
-                st.rerun()
-
-        _opened_as_dialog = False
-
-        # Preferência: modal nativo (padrão novo) — st.dialog é um *decorator*, não um context manager
-        if hasattr(st, "dialog"):
-            try:
-                @st.dialog(title_recorte)
-                def _dlg_recorte():
-                    _render_recorte_table()
-                _dlg_recorte()
-                _opened_as_dialog = True
-            except Exception:
-                _opened_as_dialog = False
-
-        # Compatibilidade: versões intermediárias — st.experimental_dialog também é decorator
-        if (not _opened_as_dialog) and hasattr(st, "experimental_dialog"):
-            try:
-                @st.experimental_dialog(title_recorte)
-                def _dlg_recorte_exp():
-                    _render_recorte_table()
-                _dlg_recorte_exp()
-                _opened_as_dialog = True
-            except Exception:
-                _opened_as_dialog = False
-
-        # Fallback universal (sempre funciona): painel expansível (sem aviso “de erro” para o usuário)
-        if not _opened_as_dialog:
-            with st.expander(title_recorte, expanded=True):
-                _render_recorte_table()
-
-# Tabela final (barra clicada)
+    # Tabela do recorte (barra clicada no gráfico interativo)
     if show_table:
         df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
         df_table = apply_table_focus(df_table_base)
 
-        info_sel = ""
-        if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
-            info_sel = f" | Seleção: {st.session_state.table_focus_level}={st.session_state.table_focus_value}"
-        st.subheader(f"Recorte (tabela) — filtros + drill + barra clicada{info_sel}")
-        st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
+        has_focus = (st.session_state.table_focus_level is not None) and (st.session_state.table_focus_value is not None)
+        if not has_focus:
+            st.info("Clique em uma barra do gráfico de Ocorrências para ver a lista completa das ocorrências daquele recorte.")
+        else:
+            info_sel = f"{st.session_state.table_focus_level}={st.session_state.table_focus_value}"
+            with st.expander(f"📋 Ocorrências do recorte — {info_sel} (clique para abrir/fechar)", expanded=True):
+                st.caption("Tabela com **todas as colunas** do recorte selecionado.")
+                st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
+
+                # Download do recorte em Excel
+                try:
+                    excel_bytes = _df_to_excel_bytes(df_table.sort_values(COL_DATA, ascending=False), sheet_name="RECORTE")
+                    st.download_button(
+                        "⬇️ Baixar recorte em Excel",
+                        data=excel_bytes,
+                        file_name=f"recorte_{st.session_state.table_focus_level}_{st.session_state.table_focus_value}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as e:
+                    st.error(f"Não foi possível gerar o Excel do recorte: {e}")
 
 with tab2:
     if not total:
@@ -1313,7 +1202,7 @@ with tab2:
 
         titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
         fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
-        fig3 = fig_bar_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
+        fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
         fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
@@ -1345,3 +1234,22 @@ with tab2:
         file_name=f"Resumo_{APP_NAME.replace(' ', '_')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# =========================================================
+# Salva última consulta (persistência)
+# =========================================================
+try:
+    save_last_query({
+        "ano_sel": st.session_state.get("ano_sel"),
+        "mes_sel": st.session_state.get("mes_sel"),
+        "resp_occ_sel": st.session_state.get("resp_occ_sel"),
+        "drill_level": st.session_state.get("drill_level"),
+        "drill_year": st.session_state.get("drill_year"),
+        "drill_month": st.session_state.get("drill_month"),
+        "table_focus_level": st.session_state.get("table_focus_level"),
+        "table_focus_value": st.session_state.get("table_focus_value"),
+        "filtros_sel": st.session_state.get("filtros_sel", {}),
+    })
+except Exception:
+    pass
