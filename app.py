@@ -4,6 +4,10 @@
 # - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Pizza e Atrasadas
 
 import io
+import os
+import json
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -24,9 +28,48 @@ from reportlab.lib.utils import ImageReader
 
 
 # =========================================================
+# Persistência local (último arquivo carregado)
+# - Guarda o último Excel enviado para reabrir o app sem precisar reenviar
+# - Funciona no mesmo servidor/PC onde o Streamlit roda
+# =========================================================
+LAST_DIR = Path(".last_input")
+LAST_DIR.mkdir(exist_ok=True)
+LAST_FILE = LAST_DIR / "last_excel.bin"
+LAST_META = LAST_DIR / "last_excel_meta.json"
+
+
+def _save_last_upload(xls_bytes: bytes, filename: str, sheet_name: str):
+    try:
+        LAST_FILE.write_bytes(xls_bytes)
+        LAST_META.write_text(
+            json.dumps(
+                {"filename": filename or "ultimo.xlsx", "sheet": sheet_name or DEFAULT_SHEET},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Se falhar (permissão, etc.), apenas não persiste.
+        pass
+
+
+def _load_last_upload():
+    try:
+        if LAST_FILE.exists():
+            b = LAST_FILE.read_bytes()
+            meta = {}
+            if LAST_META.exists():
+                meta = json.loads(LAST_META.read_text(encoding="utf-8"))
+            return b, meta
+    except Exception:
+        return None, {}
+    return None, {}
+
+# =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V22.02.26_T"
+APP_VERSION = "V01.03.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -117,8 +160,17 @@ def normalizar_situacao(x: str) -> str:
     return s
 
 
-def _titulo_filtro(ano_sel: str, mes_sel: str, resp_occ_sel: str) -> str:
-    return f"Ano {ano_sel} | Mês {mes_sel} | Resp ocorrência {resp_occ_sel}"
+def _titulo_filtro(anos_sel, mes_sel: str, resp_occ_sel: str) -> str:
+    # anos_sel pode ser lista (multi-seleção) ou string
+    if isinstance(anos_sel, (list, tuple, set)):
+        if not anos_sel:
+            ano_txt = "(Nenhum)"
+        else:
+            ano_txt = ", ".join([str(a) for a in anos_sel])
+    else:
+        ano_txt = str(anos_sel)
+
+    return f"Ano(s) {ano_txt} | Mês {mes_sel} | Resp ocorrência {resp_occ_sel}"
 
 
 def semana_do_mes(dt_series: pd.Series) -> pd.Series:
@@ -370,11 +422,18 @@ def carregar_df(upload_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filters: dict) -> pd.DataFrame:
+def aplicar_filtros(df: pd.DataFrame, anos_sel, mes_sel, resp_occ_sel, multi_filters: dict) -> pd.DataFrame:
     dff = df.copy()
 
-    if ano_sel != "(Todos)":
-        dff = dff[dff[COL_DATA].dt.year == int(ano_sel)]
+    # anos_sel: lista de anos selecionados (multi-seleção)
+    if anos_sel is not None:
+        anos_list = [int(a) for a in anos_sel if str(a).strip() != ""]
+        if len(anos_list) == 0:
+            return dff.iloc[0:0]
+        # se não selecionou TODOS os anos, filtra
+        anos_disponiveis = sorted(dff[COL_DATA].dt.year.dropna().unique().tolist())
+        if len(anos_list) != len(anos_disponiveis):
+            dff = dff[dff[COL_DATA].dt.year.isin(anos_list)]
 
     if mes_sel != "(Todos)":
         mes_num = INV_MESES_ABREV.get(mes_sel)
@@ -424,18 +483,24 @@ def clear_table_focus():
     st.session_state.table_focus_value = None
 
 
-def resolve_initial_level(ano_sel: str, mes_sel: str):
-    if ano_sel == "(Todos)":
-        return "ANO"
+def resolve_initial_level(anos_sel, mes_sel: str):
+    # Se há mais de um ano no recorte, a visão inicial vira MÊS/ANO
+    anos_list = list(anos_sel) if isinstance(anos_sel, (list, tuple, set)) else []
+    if len(anos_list) > 1 and mes_sel == "(Todos)":
+        return "MES_ANO"
+    if len(anos_list) == 0 or (len(anos_list) > 1 and mes_sel != "(Todos)"):
+        # com multi-anos + mês fixo, faz sentido ir direto para SEMANA
+        return "SEMANA"
+    # 1 ano selecionado
     if mes_sel == "(Todos)":
         return "MES"
     return "SEMANA"
 
 
-def apply_drill_filters(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str) -> pd.DataFrame:
+def apply_drill_filters(df_filtrado: pd.DataFrame, anos_sel, mes_sel: str) -> pd.DataFrame:
     dff = df_filtrado.copy()
 
-    if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
+    if st.session_state.drill_year is not None and (isinstance(anos_sel, (list, tuple, set)) and len(anos_sel) > 1):
         dff = dff[dff[COL_DATA].dt.year == int(st.session_state.drill_year)]
 
     if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
@@ -467,6 +532,18 @@ def apply_table_focus(df_context: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             return df_context
 
+    elif lvl == "MES_ANO":
+        try:
+            lab = str(val).strip()
+            if "/" in lab:
+                mes_ab, ano_txt = lab.split("/", 1)
+                m = INV_MESES_ABREV.get(mes_ab.strip())
+                y = int(ano_txt.strip())
+                if m:
+                    dff = dff[(dff[COL_DATA].dt.year == y) & (dff[COL_DATA].dt.month == int(m))]
+        except Exception:
+            return df_context
+
     elif lvl == "SEMANA":
         try:
             s = str(val).replace("ª", "").strip()
@@ -480,24 +557,43 @@ def apply_table_focus(df_context: pd.DataFrame) -> pd.DataFrame:
     return dff
 
 
-def occurrences_dataset(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str):
+def occurrences_dataset(df_filtrado: pd.DataFrame, anos_sel, mes_sel: str):
     level = st.session_state.drill_level
     if level == "AUTO":
-        level = resolve_initial_level(ano_sel, mes_sel)
+        level = resolve_initial_level(anos_sel, mes_sel)
 
     breadcrumb = []
 
-    if level == "ANO":
-        g = df_filtrado.groupby(df_filtrado[COL_DATA].dt.year).size().sort_index()
-        df_plot = pd.DataFrame({"Ano": g.index.astype(int), "Ocorrências": g.values.astype(int)})
-        breadcrumb.append("Visão: Ano")
-        return df_plot, "ANO", " > ".join(breadcrumb)
+    # -------------------------
+    # NOVO: MÊS/ANO (quando seleciono mais de um ano)
+    # -------------------------
+    if level == "MES_ANO":
+        dff = df_filtrado.copy()
+        dff["_Y"] = dff[COL_DATA].dt.year.astype(int)
+        dff["_M"] = dff[COL_DATA].dt.month.astype(int)
+        g = dff.groupby(["_Y", "_M"]).size().reset_index(name="Ocorrências")
+        g["_KEY"] = g["_Y"] * 100 + g["_M"]
+        g = g.sort_values("_KEY")
+        g["Mês/Ano"] = g.apply(lambda r: f"{MESES_ABREV.get(int(r['_M']), r['_M'])}/{int(r['_Y'])}", axis=1)
+        df_plot = g[["Mês/Ano", "Ocorrências"]].copy()
+        breadcrumb.append("Visão: Mês/Ano")
+        return df_plot, "MES_ANO", " > ".join(breadcrumb)
 
-    if ano_sel != "(Todos)":
-        ano_alvo = int(ano_sel)
-    else:
-        ano_alvo = int(st.session_state.drill_year) if st.session_state.drill_year is not None else None
+    # -------------------------
+    # MES / SEMANA (1 ano ou drill definido)
+    # -------------------------
+    anos_list = [int(a) for a in (anos_sel or [])] if isinstance(anos_sel, (list, tuple, set)) else []
+    ano_alvo = None
 
+    # Quando só 1 ano foi selecionado, ele é o alvo
+    if len(anos_list) == 1:
+        ano_alvo = int(anos_list[0])
+
+    # Quando o recorte tem múltiplos anos, o alvo vem do drill (clique no Mês/Ano)
+    if len(anos_list) > 1 and st.session_state.drill_year is not None:
+        ano_alvo = int(st.session_state.drill_year)
+
+    # Se ainda não tenho ano alvo, volto para uma visão por ano
     if ano_alvo is None:
         g = df_filtrado.groupby(df_filtrado[COL_DATA].dt.year).size().sort_index()
         df_plot = pd.DataFrame({"Ano": g.index.astype(int), "Ocorrências": g.values.astype(int)})
@@ -514,10 +610,12 @@ def occurrences_dataset(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str):
         breadcrumb.append("Visão: Mês")
         return df_plot, "MES", " > ".join(breadcrumb)
 
+    # SEMANA
+    mes_alvo = None
     if mes_sel != "(Todos)":
         mes_alvo = int(INV_MESES_ABREV.get(mes_sel))
-    else:
-        mes_alvo = int(st.session_state.drill_month) if st.session_state.drill_month is not None else None
+    elif st.session_state.drill_month is not None:
+        mes_alvo = int(st.session_state.drill_month)
 
     if mes_alvo is None:
         df_ano["MesNum"] = df_ano[COL_DATA].dt.month.astype(int)
@@ -559,26 +657,31 @@ def get_clicked_x(plotly_event):
     return None
 
 
-def can_go_back(level_now: str, ano_sel: str, mes_sel: str) -> bool:
+def can_go_back(level_now: str, anos_sel, mes_sel: str) -> bool:
     if level_now == "SEMANA":
         return (mes_sel == "(Todos)") and (st.session_state.drill_month is not None)
     if level_now == "MES":
-        return (ano_sel == "(Todos)") and (st.session_state.drill_year is not None)
+        return (isinstance(anos_sel, (list, tuple, set)) and len(anos_sel) > 1) and (st.session_state.drill_year is not None)
+    if level_now == "MES_ANO":
+        return False
     return False
 
 
-def go_back_one_level(level_now: str, ano_sel: str, mes_sel: str):
+def go_back_one_level(level_now: str, anos_sel, mes_sel: str):
     if level_now == "SEMANA" and mes_sel == "(Todos)" and st.session_state.drill_month is not None:
-        st.session_state.drill_level = "MES"
+        # volta para MES (1 ano) ou MES_ANO (multi-anos)
+        st.session_state.drill_level = "MES_ANO" if (isinstance(anos_sel, (list, tuple, set)) and len(anos_sel) > 1) else "MES"
         st.session_state.drill_month = None
         clear_table_focus()
         return True
-    if level_now == "MES" and ano_sel == "(Todos)" and st.session_state.drill_year is not None:
-        st.session_state.drill_level = "ANO"
+
+    if level_now == "MES" and (isinstance(anos_sel, (list, tuple, set)) and len(anos_sel) > 1) and st.session_state.drill_year is not None:
+        st.session_state.drill_level = "MES_ANO"
         st.session_state.drill_year = None
         st.session_state.drill_month = None
         clear_table_focus()
         return True
+
     return False
 
 
@@ -661,6 +764,15 @@ def fig_ocorrencias(df_plot: pd.DataFrame, level: str):
         fig = px.bar(df_plot, x="Ano", y="Ocorrências", title="Ocorrências (clique para detalhar)")
         fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
         _apply_threshold_colors(fig, df_plot["Ocorrências"].tolist(), LIMIAR_OCORRENCIAS)
+        _hide_yaxis(fig)
+        _common_bar_layout(fig, height=460)
+        return fig
+
+    if level == "MES_ANO":
+        fig = px.bar(df_plot, x="Mês/Ano", y="Ocorrências", title="Ocorrências por mês/ano (clique para detalhar por semana)")
+        fig.update_traces(text=df_plot["Ocorrências"], textposition="outside", cliponaxis=False)
+        _apply_threshold_colors(fig, df_plot["Ocorrências"].tolist(), LIMIAR_OCORRENCIAS)
+        fig.update_layout(xaxis_tickangle=-45)
         _hide_yaxis(fig)
         _common_bar_layout(fig, height=460)
         return fig
@@ -841,26 +953,67 @@ st.caption("Painel interativo (Ocorrências) lado a lado com Motivos + Pizza + A
 
 with st.sidebar:
     st.header("📥 Entrada")
+
+    # tenta ler último arquivo salvo
+    last_bytes, last_meta = _load_last_upload()
+    last_name = last_meta.get("filename", "último arquivo")
+    last_sheet_default = last_meta.get("sheet", DEFAULT_SHEET)
+
     up = st.file_uploader("Envie o Excel (ex.: Consultas_RNC.xlsx)", type=["xlsx", "xlsm", "xls"])
-    sheet = st.text_input("Nome da aba (sheet)", value=DEFAULT_SHEET)
+    sheet = st.text_input("Nome da aba (sheet)", value=last_sheet_default)
+
     st.divider()
     st.caption("Senha do app: QualidadeRS")
 
-if not up:
-    st.info("Envie o arquivo Excel para começar.")
-    st.stop()
+# Decide a fonte do Excel (upload atual ou último salvo)
+upload_bytes = None
+upload_name = None
+
+if up is not None:
+    upload_bytes = up.getvalue()
+    upload_name = up.name
+else:
+    # se não enviou nada agora, usa o último salvo (se existir)
+    if last_bytes:
+        upload_bytes = last_bytes
+        upload_name = last_name
+        st.info(f"Usando o último arquivo salvo: {upload_name}")
+    else:
+        st.info("Envie o arquivo Excel para começar (ou rode uma vez para gravar o último arquivo).")
+        st.stop()
 
 try:
-    df_base = carregar_df(up.getvalue(), sheet)
+    df_base = carregar_df(upload_bytes, sheet)
+    # persiste o último carregamento com sucesso
+    _save_last_upload(upload_bytes, upload_name or "ultimo.xlsx", sheet)
+except Exception as e:
+    st.error(f"Erro ao carregar: {e}")
+    st.stop()
 except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
 
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
-c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
+c1, c2, c3, c4, c5 = st.columns([1.4, 1, 1.6, 1.2, 1.1])
 
 with c1:
-    ano_sel = st.selectbox("Ano", ["(Todos)"] + [str(a) for a in anos], index=0)
+    # ✅ Multi-seleção de anos (por padrão, todos selecionados)
+    anos_sel = st.multiselect("Ano(s)", options=[str(a) for a in anos], default=[str(a) for a in anos])
+with c2:
+    mes_sel = st.selectbox("Mês", ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0)
+with c3:
+    if COL_RESP_OCORRENCIA in df_base.columns:
+        resp_vals = sorted(df_base[COL_RESP_OCORRENCIA].dropna().astype(str).replace("nan", "").unique().tolist())
+        resp_vals = [v for v in resp_vals if v != ""]
+    else:
+        resp_vals = []
+    resp_occ_sel = st.selectbox("Resp. ocorrência", ["(Todos)"] + resp_vals, index=0)
+with c4:
+    show_table = st.toggle("Mostrar tabela", value=True)
+with c5:
+    if st.button("🔄 Reset drill"):
+        reset_drill()
+        st.rerun()
 with c2:
     mes_sel = st.selectbox("Mês", ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0)
 with c3:
@@ -889,7 +1042,7 @@ with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
             sel = st.multiselect(col, options=vals, default=vals)
         multi_filters[col] = sel
 
-df_filtrado = aplicar_filtros(df_base, ano_sel, mes_sel, resp_occ_sel, multi_filters)
+df_filtrado = aplicar_filtros(df_base, anos_sel, mes_sel, resp_occ_sel, multi_filters)
 
 total = int(len(df_filtrado))
 situ = df_filtrado[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_filtrado.columns and total) else pd.Series([], dtype=str)
@@ -912,26 +1065,26 @@ with tab1:
         st.stop()
 
     # Ocorrências (dataset + figura)
-    df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
+    df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, anos_sel, mes_sel)
     fig_occ = fig_ocorrencias(df_occ_plot, level_now)
 
     # Base final (filtros + drill) para Motivos + Pizza
-    df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+    df_final = apply_drill_filters(df_filtrado, anos_sel, mes_sel)
     df_mot_sel = calc_motivos(df_final, top_n=12)
     df_resp_sel = calc_resp_analise(df_final)
     df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
     fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
-    titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
-    fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
+    titulo_ano = ", ".join(anos_sel) if anos_sel else "Nenhum"
+    fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano(s): {titulo_ano})")
 
     # Barra superior (controles drill/tabela)
     topbar1, topbar2, topbar3 = st.columns([1.2, 1.4, 3.4])
     with topbar1:
-        if can_go_back(level_now, ano_sel, mes_sel):
+        if can_go_back(level_now, anos_sel, mes_sel):
             if st.button("⬅ Voltar (um nível)"):
-                if go_back_one_level(level_now, ano_sel, mes_sel):
+                if go_back_one_level(level_now, anos_sel, mes_sel):
                     st.rerun()
     with topbar2:
         if st.button("🧹 Limpar seleção da tabela"):
@@ -966,7 +1119,8 @@ with tab1:
                 st.session_state.table_focus_value = clicked
 
                 # drill
-                if level_now == "ANO" and ano_sel == "(Todos)":
+                if level_now == "ANO":
+                    # Drill Ano -> Mês (quando o gráfico está em nível Ano)
                     try:
                         st.session_state.drill_year = int(clicked)
                         st.session_state.drill_level = "MES"
@@ -974,6 +1128,24 @@ with tab1:
                         st.rerun()
                     except Exception:
                         pass
+
+                elif level_now == "MES_ANO":
+                    # Drill Mês/Ano -> Semana
+                    try:
+                        lab = str(clicked).strip()
+                        # formato esperado: "Jan/2025"
+                        if "/" in lab:
+                            mes_ab, ano_txt = lab.split("/", 1)
+                            mes_num = INV_MESES_ABREV.get(mes_ab.strip())
+                            ano_num = int(ano_txt.strip())
+                            if mes_num:
+                                st.session_state.drill_year = ano_num
+                                st.session_state.drill_month = int(mes_num)
+                                st.session_state.drill_level = "SEMANA"
+                                st.rerun()
+                    except Exception:
+                        pass
+
                 elif level_now == "MES" and mes_sel == "(Todos)":
                     mes_num = INV_MESES_ABREV.get(str(clicked))
                     if mes_num:
@@ -995,7 +1167,7 @@ with tab1:
 
     # Tabela final (barra clicada)
     if show_table:
-        df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+        df_table_base = apply_drill_filters(df_filtrado, anos_sel, mes_sel)
         df_table = apply_table_focus(df_table_base)
 
         info_sel = ""
@@ -1009,11 +1181,11 @@ with tab2:
         st.info("Quando houver registros no filtro, as exportações ficam disponíveis.")
         st.stop()
 
-    df_final_export = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+    df_final_export = apply_drill_filters(df_filtrado, anos_sel, mes_sel)
 
-    filtro_txt = _titulo_filtro(ano_sel, mes_sel, resp_occ_sel)
+    filtro_txt = _titulo_filtro(anos_sel, mes_sel, resp_occ_sel)
     drill_txt = []
-    if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
+    if st.session_state.drill_year is not None and (isinstance(anos_sel, (list, tuple, set)) and len(anos_sel) > 1):
         drill_txt.append(f"Ano(clicado)={st.session_state.drill_year}")
     if mes_sel == "(Todos)" and st.session_state.drill_month is not None:
         drill_txt.append(f"Mês(clicado)={MESES_ABREV.get(int(st.session_state.drill_month), st.session_state.drill_month)}")
@@ -1030,17 +1202,17 @@ with tab2:
 
     st.subheader("📄 PDF do Dashboard (1 página, 4 gráficos)")
     try:
-        df_occ_plot2, level_now2, _ = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
+        df_occ_plot2, level_now2, _ = occurrences_dataset(df_filtrado, anos_sel, mes_sel)
         fig1 = fig_ocorrencias(df_occ_plot2, level_now2)
 
         df_mot_pdf = calc_motivos(df_final_export, top_n=12)
         df_resp_pdf = calc_resp_analise(df_final_export)
         df_atras_pdf = calc_atrasadas_por_filtro(df_filtrado)
 
-        titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
+        titulo_ano_pdf = ", ".join(anos_sel) if anos_sel else "Nenhum"
         fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
         fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
-        fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
+        fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano(s): {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
             app_name=APP_NAME,
