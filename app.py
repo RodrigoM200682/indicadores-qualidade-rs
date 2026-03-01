@@ -31,7 +31,7 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V22.02.26_T"
+APP_VERSION = "V01.03.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -93,6 +93,14 @@ def save_last_consulta(cons: dict):
     META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # Colunas esperadas (base Reclamações)
+
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Dados") -> bytes:
+    """Converte um DataFrame em XLSX (bytes) para download."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
 COL_CODIGO = "Código"
 COL_TITULO = "Título"
 COL_STATUS = "Status"
@@ -470,6 +478,9 @@ def init_drill_state():
         st.session_state.table_focus_level = None  # "ANO"/"MES"/"SEMANA"
     if "table_focus_value" not in st.session_state:
         st.session_state.table_focus_value = None
+    if "show_table_dialog" not in st.session_state:
+        st.session_state.show_table_dialog = False
+
 
 
 def reset_drill():
@@ -478,11 +489,13 @@ def reset_drill():
     st.session_state.drill_month = None
     st.session_state.table_focus_level = None
     st.session_state.table_focus_value = None
+    st.session_state.show_table_dialog = False
 
 
 def clear_table_focus():
     st.session_state.table_focus_level = None
     st.session_state.table_focus_value = None
+    st.session_state.show_table_dialog = False
 
 
 def resolve_initial_level(ano_sel: str, mes_sel: str):
@@ -1153,6 +1166,7 @@ with tab1:
                 # seleção para tabela
                 st.session_state.table_focus_level = level_now
                 st.session_state.table_focus_value = clicked
+                st.session_state.show_table_dialog = True
 
                 # drill
                 if level_now == "ANO" and ano_sel == "(Todos)":
@@ -1198,7 +1212,46 @@ with tab1:
     with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
-    # Tabela final (barra clicada)
+        # ✅ Janela (dialog) com as ocorrências da barra clicada no gráfico interativo
+    if st.session_state.get("show_table_dialog", False) and st.session_state.get("table_focus_value") is not None:
+        df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
+        df_table = apply_table_focus(df_table_base)
+
+        info_sel = ""
+        if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
+            info_sel = f"{st.session_state.table_focus_level}={st.session_state.table_focus_value}"
+
+        xlsx_bytes = df_to_xlsx_bytes(df_table, sheet_name="Recorte")
+
+        if hasattr(st, "dialog"):
+            with st.dialog(f"Ocorrências do recorte — {info_sel or 'seleção'}"):
+                st.caption("Mostro abaixo **todas as colunas** do recorte (filtros + drill + barra clicada).")
+                st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
+                st.download_button(
+                    "⬇️ Baixar recorte em Excel",
+                    data=xlsx_bytes,
+                    file_name="recorte_ocorrencias.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                if st.button("Fechar"):
+                    st.session_state.show_table_dialog = False
+                    st.rerun()
+        else:
+            # fallback para versões antigas do Streamlit
+            with st.expander(f"Ocorrências do recorte — {info_sel or 'seleção'}", expanded=True):
+                st.caption("Seu Streamlit não suporta dialog; uso este painel expansível como alternativa.")
+                st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=420)
+                st.download_button(
+                    "⬇️ Baixar recorte em Excel",
+                    data=xlsx_bytes,
+                    file_name="recorte_ocorrencias.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                if st.button("Fechar recorte"):
+                    st.session_state.show_table_dialog = False
+                    st.rerun()
+
+# Tabela final (barra clicada)
     if show_table:
         df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
         df_table = apply_table_focus(df_table_base)
