@@ -69,7 +69,7 @@ def _load_last_upload():
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V01.03.26"
+APP_VERSION = "V22.02.26_T"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -989,9 +989,6 @@ try:
 except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
-except Exception as e:
-    st.error(f"Erro ao carregar: {e}")
-    st.stop()
 
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
 c1, c2, c3, c4, c5 = st.columns([1.4, 1, 1.6, 1.2, 1.1])
@@ -1014,22 +1011,6 @@ with c5:
     if st.button("🔄 Reset drill"):
         reset_drill()
         st.rerun()
-with c2:
-    mes_sel = st.selectbox("Mês", ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0)
-with c3:
-    if COL_RESP_OCORRENCIA in df_base.columns:
-        resp_vals = sorted(df_base[COL_RESP_OCORRENCIA].dropna().astype(str).replace("nan", "").unique().tolist())
-        resp_vals = [v for v in resp_vals if v != ""]
-    else:
-        resp_vals = []
-    resp_occ_sel = st.selectbox("Resp. ocorrência", ["(Todos)"] + resp_vals, index=0)
-with c4:
-    show_table = st.toggle("Mostrar tabela", value=True)
-with c5:
-    if st.button("🔄 Reset drill"):
-        reset_drill()
-        st.rerun()
-
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
