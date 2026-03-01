@@ -1,23 +1,14 @@
 # app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
-# - Login com senha única: QualidadeRS
-# - Dashboard moderno (Plotly) com drill Ano -> Mês -> Semana (clique na barra)
-# - Barras do gráfico interativo: verde (<=8) / vermelho (>8)
-# - Motivos (Top 12) acompanha a seleção do gráfico interativo (drill)
-# - Gráfico atrasadas por responsável: SEMPRE vermelho e baseado no filtro (Ano=2025 => só 2025; Ano=Todos => todos)
-# - Histograma (barras) de participação por responsável (análise) (substitui pizza) e segue seleção do gráfico interativo
-# - Tabela final mostra apenas as reclamações referentes à barra clicada
-# - Exportar: Resumo Excel (DASHBOARD 2x2 + DADOS + RECORTE) com gráficos sem grade e sem eixo Y
-# - Exportar: PDF do Dashboard (1 página, 2x2, colorido)
-#
-# Requisitos sugeridos (pinado para Streamlit Cloud):
-# streamlit
-# pandas
-# openpyxl
-# plotly==5.24.1
-# kaleido==0.2.1
-# reportlab
+# Atualização desta versão:
+# - Painel interativo (Ocorrências) agora aparece APENAS UMA VEZ e fica LADO A LADO com Motivos (Top 12)
+# - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Pizza e Atrasadas
 
 import io
+import os
+import json
+from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -28,7 +19,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from openpyxl.chart import BarChart
+from openpyxl.chart import BarChart, PieChart
 from openpyxl.chart.reference import Reference
 from openpyxl.chart.label import DataLabelList
 
@@ -38,14 +29,70 @@ from reportlab.lib.utils import ImageReader
 
 
 # =========================================================
-# CONFIG
+# APP
 # =========================================================
-APP_VERSION = "V23.02.26"
+APP_VERSION = "V22.02.26_T"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
+# =========================================================
+# Persistência (última planilha + última consulta)
+# =========================================================
+DATA_DIR = Path("data_store")
+META_FILE = DATA_DIR / "last_state.json"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Colunas esperadas
+def _now_str():
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+def _safe_filename(name: str) -> str:
+    name = (name or "dados.xlsx").strip().replace("\\", "_").replace("/", "_")
+    return "".join(ch for ch in name if ch.isalnum() or ch in (" ", "_", "-", ".", "(", ")")).strip()
+
+def save_uploaded_excel(file_bytes: bytes, original_name: str, sheet_name: str):
+    """Salva o Excel enviado e atualiza o ponteiro da 'última planilha'."""
+    fname = _safe_filename(original_name)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stored_name = f"{stamp}__{fname}"
+    stored_path = DATA_DIR / stored_name
+    stored_path.write_bytes(file_bytes)
+
+    meta = {
+        "last_file_path": str(stored_path),
+        "original_name": fname,
+        "loaded_at": _now_str(),
+        "sheet_name": sheet_name,
+        "consulta": {},
+    }
+    META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+def load_last_excel():
+    """Carrega bytes e metadados do último Excel salvo (se existir)."""
+    if not META_FILE.exists():
+        return None, None
+    try:
+        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
+        p = Path(meta.get("last_file_path", ""))
+        if p.exists():
+            return p.read_bytes(), meta
+    except Exception:
+        return None, None
+    return None, None
+
+def save_last_consulta(cons: dict):
+    """Atualiza somente a parte de 'consulta' no JSON."""
+    if not META_FILE.exists():
+        return
+    try:
+        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    meta["consulta"] = cons or {}
+    meta["consulta_saved_at"] = _now_str()
+    META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# Colunas esperadas (base Reclamações)
 COL_CODIGO = "Código"
 COL_TITULO = "Título"
 COL_STATUS = "Status"
@@ -57,6 +104,7 @@ COL_RESP_ANALISE = "Responsável da análise de causa"
 COL_CATEGORIA = "Categoria"
 COL_SITUACAO = "Situação"  # ATRASADA / NO PRAZO
 
+# ✅ Filtros por marcar (com Categoria incluída)
 FILTROS_COLS = [
     "Status",
     "Categoria",
@@ -77,14 +125,14 @@ MESES_ABREV = {
 INV_MESES_ABREV = {v: k for k, v in MESES_ABREV.items()}
 
 # Regras de cores
-LIMIAR_OCORRENCIAS = 8
+LIMIAR_OCORRENCIAS = 8  # <=8 verde, >8 vermelho
 GREEN = "#2E7D32"
 RED = "#C62828"
 BLUE = "#1f77b4"
 
 
 # =========================================================
-# LOGIN
+# Login (senha fixa)
 # =========================================================
 def require_login():
     if "auth_ok" not in st.session_state:
@@ -108,7 +156,7 @@ def require_login():
 
 
 # =========================================================
-# UTIL
+# Utilitários
 # =========================================================
 def br_date_str(dt) -> str:
     if pd.isna(dt):
@@ -140,7 +188,7 @@ def semana_do_mes(dt_series: pd.Series) -> pd.Series:
 
 
 # =========================================================
-# EXCEL HELPERS
+# Excel helpers
 # =========================================================
 def _excel_theme():
     return {
@@ -216,7 +264,6 @@ def _hex_no_hash(hex_color: str) -> str:
 
 
 def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str | None):
-    # sem grid + sem eixo Y + rótulo de valor
     try:
         chart.y_axis.majorGridlines = None
         chart.y_axis.minorGridlines = None
@@ -224,24 +271,20 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
         chart.x_axis.minorGridlines = None
     except Exception:
         pass
-
     try:
         chart.y_axis.tickLblPos = "none"
     except Exception:
         pass
-
     try:
         chart.dLbls = DataLabelList()
         chart.dLbls.showVal = True
     except Exception:
         pass
-
     if rotate_x_45:
         try:
             chart.x_axis.textRotation = 45
         except Exception:
             pass
-
     if solid_fill_hex:
         try:
             s = chart.series[0]
@@ -249,6 +292,15 @@ def _style_xl_bar_chart(chart: BarChart, rotate_x_45: bool, solid_fill_hex: str 
             s.graphicalProperties.line.solidFill = _hex_no_hash(solid_fill_hex)
         except Exception:
             pass
+
+
+def _style_xl_pie_chart(chart: PieChart):
+    try:
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showPercent = True
+        chart.dLbls.showCatName = True
+    except Exception:
+        pass
 
 
 def _add_bar_chart_from_sheet(
@@ -275,8 +327,27 @@ def _add_bar_chart_from_sheet(
     target_ws.add_chart(chart, anchor_cell)
 
 
+def _add_pie_chart_from_sheet(
+    data_ws, target_ws,
+    title, cat_col, val_col, start_row, end_row, anchor_cell,
+    height=7.2, width=12.5
+):
+    chart = PieChart()
+    chart.title = title
+    chart.height = float(height)
+    chart.width = float(width)
+
+    data = Reference(data_ws, min_col=val_col, min_row=start_row, max_row=end_row)
+    cats = Reference(data_ws, min_col=cat_col, min_row=start_row + 1, max_row=end_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+
+    _style_xl_pie_chart(chart)
+    target_ws.add_chart(chart, anchor_cell)
+
+
 # =========================================================
-# PDF (Plotly -> PNG via kaleido)
+# PDF do Dashboard (1 página) — Plotly -> PNG via kaleido
 # =========================================================
 def build_dashboard_pdf_bytes(app_name: str, filtro_txt: str, kpis: dict, figs_plotly: list) -> bytes:
     img_bytes_list = []
@@ -335,7 +406,7 @@ def build_dashboard_pdf_bytes(app_name: str, filtro_txt: str, kpis: dict, figs_p
 
 
 # =========================================================
-# LOAD + FILTERS
+# Carregamento e filtros
 # =========================================================
 @st.cache_data(show_spinner=False)
 def carregar_df(upload_bytes: bytes, sheet_name: str) -> pd.DataFrame:
@@ -385,7 +456,7 @@ def aplicar_filtros(df: pd.DataFrame, ano_sel, mes_sel, resp_occ_sel, multi_filt
 
 
 # =========================================================
-# DRILL STATE
+# Drilldown + seleção da tabela
 # =========================================================
 def init_drill_state():
     if "drill_level" not in st.session_state:
@@ -425,7 +496,6 @@ def resolve_initial_level(ano_sel: str, mes_sel: str):
 def apply_drill_filters(df_filtrado: pd.DataFrame, ano_sel: str, mes_sel: str) -> pd.DataFrame:
     dff = df_filtrado.copy()
 
-    # Só aplica drill quando o filtro do topo está em "(Todos)"
     if ano_sel == "(Todos)" and st.session_state.drill_year is not None:
         dff = dff[dff[COL_DATA].dt.year == int(st.session_state.drill_year)]
 
@@ -462,6 +532,7 @@ def apply_table_focus(df_context: pd.DataFrame) -> pd.DataFrame:
         try:
             s = str(val).replace("ª", "").strip()
             w = int(s)
+            dff = dff.copy()
             dff["_SEMANA_MES"] = semana_do_mes(dff[COL_DATA])
             dff = dff[dff["_SEMANA_MES"] == w].drop(columns=["_SEMANA_MES"], errors="ignore")
         except Exception:
@@ -573,7 +644,7 @@ def go_back_one_level(level_now: str, ano_sel: str, mes_sel: str):
 
 
 # =========================================================
-# DATASETS (seguem seleção do interativo)
+# Datasets (seguindo seleção)
 # =========================================================
 def calc_resp_analise(df_context: pd.DataFrame):
     resp = (
@@ -624,7 +695,7 @@ def calc_atrasadas_por_filtro(df_filtro_base: pd.DataFrame):
 
 
 # =========================================================
-# PLOTLY (sem eixo Y)
+# Plotly styling (sem eixo Y)
 # =========================================================
 def _hide_yaxis(fig):
     fig.update_yaxes(showticklabels=False, title=None, showgrid=True)
@@ -633,7 +704,10 @@ def _hide_yaxis(fig):
 
 
 def _common_bar_layout(fig, height=460):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=55, b=10))
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=10, t=55, b=10),
+    )
     return fig
 
 
@@ -677,15 +751,10 @@ def fig_motivos(df_mot: pd.DataFrame, titulo: str):
     return fig
 
 
-def fig_hist_participacao(df_resp: pd.DataFrame, titulo: str):
-    # HISTOGRAMA (barras) — substitui pizza
-    if df_resp.empty:
-        df_resp = pd.DataFrame({"Responsável (análise)": ["SEM DADOS"], "Ocorrências": [0]})
-
-    fig = px.bar(df_resp, x="Responsável (análise)", y="Ocorrências", title=titulo)
-    fig.update_traces(text=df_resp["Ocorrências"], textposition="outside", cliponaxis=False, marker_color=BLUE)
-    fig.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
-    fig.update_yaxes(showticklabels=False, title=None)
+def fig_pizza_participacao(df_resp: pd.DataFrame, titulo: str):
+    fig = px.pie(df_resp, names="Responsável (análise)", values="Ocorrências", title=titulo, hole=0.35)
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=55, b=10), showlegend=False)
     return fig
 
 
@@ -700,7 +769,8 @@ def fig_atrasadas_vermelho(df_atras: pd.DataFrame, titulo: str):
 
 
 # =========================================================
-# EXPORT: EXCEL (2x2 + DADOS + RECORTE)
+# Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza
+# (mesmo da sua versão anterior; mantido para não quebrar export)
 # =========================================================
 def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd.DataFrame, titulo_filtro: str) -> bytes:
     dff = df_filtrado_final.copy()
@@ -716,23 +786,16 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     else:
         total_atras_rec = 0
 
-    # (A) Ocorrências por mês do recorte final
     dff_mes = dff.copy()
     dff_mes["MesNum"] = dff_mes[COL_DATA].dt.month.astype(int)
     g_mes = dff_mes.groupby("MesNum").size().reindex(range(1, 13), fill_value=0)
     df_mes = pd.DataFrame({"Mês": [MESES_ABREV[m] for m in range(1, 13)], "Ocorrências": g_mes.values.astype(int)})
 
-    # (B) Motivos top 12 do recorte final
+    df_resp = calc_resp_analise(dff)
+    df_atras = calc_atrasadas_por_filtro(df_filtro_base)
     df_mot = calc_motivos(dff, top_n=12)
 
-    # (C) Histograma por responsável (análise) do recorte final
-    df_resp = calc_resp_analise(dff)
-
-    # (D) Atrasadas por responsável conforme filtro (sem drill)
-    df_atras = calc_atrasadas_por_filtro(df_filtro_base)
-
     wb = Workbook()
-
     ws = wb.active
     ws.title = "DASHBOARD"
     ws.sheet_view.showGridLines = False
@@ -765,7 +828,6 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     ws["E9"] = total_atras_rec; ws["E9"].font = Font(bold=True, size=14)
     ws["B10"] = "Obs.: tabelas base ficam na aba DADOS."; ws.merge_cells("B10:E10")
 
-    # DADOS
     wsd = wb.create_sheet("DADOS")
     wsd.sheet_view.showGridLines = True
     _set_col_widths(wsd, {"A": 2, "B": 34, "C": 22, "D": 34, "E": 22, "F": 2})
@@ -781,14 +843,13 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     r2s, _, r2e, _, _ = _add_table(wsd, r + 1, 2, df_mot, table_name="T_MOT", style="TableStyleMedium9")
 
     r = r2e + 3
-    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — Histograma (recorte final)"; wsd[f"B{r}"].font = Font(bold=True)
-    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_HIST", style="TableStyleMedium9")
+    wsd[f"B{r}"] = "3) Participação por Responsável (análise) — recorte final (Pizza)"; wsd[f"B{r}"].font = Font(bold=True)
+    r3s, _, r3e, _, _ = _add_table(wsd, r + 1, 2, df_resp, table_name="T_RESP_PIE", style="TableStyleMedium9")
 
     r = r3e + 3
-    wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro"; wsd[f"B{r}"].font = Font(bold=True)
+    wsd[f"B{r}"] = "4) Atrasadas por Responsável (análise) — conforme filtro (sem drill)"; wsd[f"B{r}"].font = Font(bold=True)
     r4s, _, r4e, _, _ = _add_table(wsd, r + 1, 2, df_atras, table_name="T_ATRAS_FILTRO", style="TableStyleMedium7")
 
-    # condicional atrasadas > 0 (col C)
     try:
         rng = f"C{r4s+1}:C{r4e}"
         wsd.conditional_formatting.add(
@@ -797,17 +858,15 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
     except Exception:
         pass
 
-    # DASHBOARD 2x2 (grids off; y labels off; values on bars)
     _add_bar_chart_from_sheet(wsd, ws, "Ocorrências por mês (recorte)", 2, 3, r1s, r1e, "B12",
                               rotate_x_45=False, height=7.2, width=12.5, solid_fill_hex=BLUE)
     _add_bar_chart_from_sheet(wsd, ws, "Motivos (Top 12) — recorte", 2, 3, r2s, r2e, "D12",
                               rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE)
-    _add_bar_chart_from_sheet(wsd, ws, "Participação por responsável (análise) — Histograma", 2, 3, r3s, r3e, "B28",
-                              rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=BLUE)
-    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — filtro", 2, 3, r4s, r4e, "D28",
+    _add_pie_chart_from_sheet(wsd, ws, "Participação por responsável (análise) — recorte", 2, 3, r3s, r3e, "B28",
+                              height=7.2, width=12.5)
+    _add_bar_chart_from_sheet(wsd, ws, "Atrasadas por responsável (análise) — conforme filtro", 2, 3, r4s, r4e, "D28",
                               rotate_x_45=True, height=7.2, width=12.5, solid_fill_hex=RED)
 
-    # RECORTE (lista)
     ws2 = wb.create_sheet("RECORTE")
     ws2.sheet_view.showGridLines = True
     _merge_title(ws2, "A1:H1", "LISTA DE OCORRÊNCIAS — RECORTE FINAL (FILTRO + DRILL)")
@@ -832,55 +891,139 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
 
 
 # =========================================================
-# STREAMLIT UI
+# UI Streamlit
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
 require_login()
 init_drill_state()
 
 st.title(f"📊 {APP_NAME}")
-st.caption("Ocorrências (interativo) + Motivos (Top 12) + Participação (Histograma) + Atrasadas + Exportações Excel/PDF.")
+st.caption("Painel interativo (Ocorrências) lado a lado com Motivos + Pizza + Atrasadas + Tabela por barra clicada.")
 
 with st.sidebar:
     st.header("📥 Entrada")
-    up = st.file_uploader("Envie o Excel (ex.: Consultas_RNC.xlsx)", type=["xlsx", "xlsm", "xls"])
-    sheet = st.text_input("Nome da aba (sheet)", value=DEFAULT_SHEET)
+
+    # Carrega referência da última planilha (se existir)
+    last_bytes, last_meta = load_last_excel()
+
+    if last_meta:
+        st.success("Última planilha encontrada ✅")
+        st.write(f"**Arquivo:** {last_meta.get('original_name','-')}")
+        st.write(f"**Carregado em:** {last_meta.get('loaded_at','-')}")
+        st.write(f"**Aba (sheet):** {last_meta.get('sheet_name', DEFAULT_SHEET)}")
+        if st.button("🧹 Esquecer última planilha"):
+            try:
+                META_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.rerun()
+        st.divider()
+
+    up = st.file_uploader("Enviar nova planilha (substitui a última)", type=["xlsx", "xlsm", "xls"])
+    sheet = st.text_input(
+        "Nome da aba (sheet)",
+        value=(last_meta.get("sheet_name") if last_meta else DEFAULT_SHEET),
+        help="Se a sua planilha usa outra aba, ajuste aqui.",
+    )
     st.divider()
     st.caption("Senha do app: QualidadeRS")
 
-if not up:
-    st.info("Envie o arquivo Excel para começar.")
+# Define fonte de dados:
+source_bytes = None
+source_meta = None
+
+if up is not None:
+    try:
+        source_bytes = up.getvalue()
+        source_meta = save_uploaded_excel(source_bytes, up.name, sheet)
+    except Exception as e:
+        st.error(f"Não consegui salvar a planilha enviada. Detalhe: {e}")
+        st.stop()
+else:
+    # Sem upload: usa automaticamente a última planilha salva
+    if last_bytes is not None:
+        source_bytes = last_bytes
+        source_meta = last_meta
+
+if source_bytes is None:
+    st.info("Envie uma planilha (primeira vez) — depois o app abre sempre com a última planilha salva.")
     st.stop()
 
 try:
-    df_base = carregar_df(up.getvalue(), sheet)
+    df_base = carregar_df(source_bytes, sheet)
 except Exception as e:
     st.error(f"Erro ao carregar: {e}")
     st.stop()
 
-# filtros rápidos (topo)
+# =========================================================
+# Recupera última consulta (filtros) — se existir
+# =========================================================
+_last_consulta = {}
+try:
+    if isinstance(source_meta, dict):
+        _last_consulta = source_meta.get("consulta") or {}
+except Exception:
+    _last_consulta = {}
+
+def _pick_select_index(options, saved_value, default_index=0):
+    try:
+        if saved_value in options:
+            return options.index(saved_value)
+    except Exception:
+        pass
+    return default_index
+
+def _default_multisel(all_options, saved_list):
+    if not saved_list:
+        return all_options  # padrão: tudo selecionado
+    s = set(str(x) for x in saved_list)
+    out = [v for v in all_options if str(v) in s]
+    return out if out else all_options
+
+
+# Restaura estado do drill/tabela da última consulta (se existir)
+try:
+    if isinstance(_last_consulta, dict):
+        if _last_consulta.get("drill_level") in ("AUTO", "ANO", "MES", "SEMANA"):
+            st.session_state.drill_level = _last_consulta.get("drill_level")
+        if _last_consulta.get("drill_year") is not None:
+            st.session_state.drill_year = _last_consulta.get("drill_year")
+        if _last_consulta.get("drill_month") is not None:
+            st.session_state.drill_month = _last_consulta.get("drill_month")
+        if _last_consulta.get("table_focus_level") is not None:
+            st.session_state.table_focus_level = _last_consulta.get("table_focus_level")
+        if _last_consulta.get("table_focus_value") is not None:
+            st.session_state.table_focus_value = _last_consulta.get("table_focus_value")
+except Exception:
+    pass
+
 anos = sorted(df_base[COL_DATA].dt.year.dropna().unique().tolist())
 c1, c2, c3, c4, c5 = st.columns([1, 1, 1.6, 1.2, 1.1])
 
 with c1:
-    ano_sel = st.selectbox("Ano", ["(Todos)"] + [str(a) for a in anos], index=0)
+    _ano_opts = ["(Todos)"] + [str(a) for a in anos]
+    _ano_saved = (_last_consulta.get("ano_sel") if isinstance(_last_consulta, dict) else None)
+    ano_sel = st.selectbox("Ano", _ano_opts, index=_pick_select_index(_ano_opts, _ano_saved, default_index=0))
 with c2:
-    mes_sel = st.selectbox("Mês", ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)], index=0)
+    _mes_opts = ["(Todos)"] + [MESES_ABREV[m] for m in range(1, 13)]
+    _mes_saved = (_last_consulta.get("mes_sel") if isinstance(_last_consulta, dict) else None)
+    mes_sel = st.selectbox("Mês", _mes_opts, index=_pick_select_index(_mes_opts, _mes_saved, default_index=0))
 with c3:
     if COL_RESP_OCORRENCIA in df_base.columns:
         resp_vals = sorted(df_base[COL_RESP_OCORRENCIA].dropna().astype(str).replace("nan", "").unique().tolist())
         resp_vals = [v for v in resp_vals if v != ""]
     else:
         resp_vals = []
-    resp_occ_sel = st.selectbox("Resp. ocorrência", ["(Todos)"] + resp_vals, index=0)
+    _resp_opts = ["(Todos)"] + resp_vals
+_resp_saved = (_last_consulta.get("resp_occ_sel") if isinstance(_last_consulta, dict) else None)
+resp_occ_sel = st.selectbox("Resp. ocorrência", _resp_opts, index=_pick_select_index(_resp_opts, _resp_saved, default_index=0))
 with c4:
-    show_table = st.toggle("Mostrar tabela", value=True)
+    show_table = st.toggle("Mostrar tabela", value=bool((_last_consulta.get("show_table") if isinstance(_last_consulta, dict) else True)))
 with c5:
     if st.button("🔄 Reset drill"):
         reset_drill()
         st.rerun()
 
-# filtros por marcar
 with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
     cols = st.columns(4)
     multi_filters = {}
@@ -890,12 +1033,30 @@ with st.expander("Filtros por marcar (clique para abrir)", expanded=False):
         vals = sorted(df_base[col].dropna().astype(str).replace("nan", "").unique().tolist())
         vals = [v for v in vals if v != ""]
         with cols[i % 4]:
-            sel = st.multiselect(col, options=vals, default=vals)
+            sel = st.multiselect(col, options=vals, default=_default_multisel(vals, (_last_consulta.get(col) if isinstance(_last_consulta, dict) else None)))
         multi_filters[col] = sel
 
 df_filtrado = aplicar_filtros(df_base, ano_sel, mes_sel, resp_occ_sel, multi_filters)
+# Salva a última consulta (para reabrir o app já com a mesma seleção)
+try:
+    _cons_to_save = {
+        "ano_sel": ano_sel,
+        "mes_sel": mes_sel,
+        "resp_occ_sel": resp_occ_sel,
+        "show_table": bool(show_table),
+        # multi-filtros (colunas do expander)
+        **{k: v for k, v in (multi_filters or {}).items()},
+        # estado do drill (para voltar exatamente onde estava)
+        "drill_level": st.session_state.get("drill_level"),
+        "drill_year": st.session_state.get("drill_year"),
+        "drill_month": st.session_state.get("drill_month"),
+        "table_focus_level": st.session_state.get("table_focus_level"),
+        "table_focus_value": st.session_state.get("table_focus_value"),
+    }
+    save_last_consulta(_cons_to_save)
+except Exception:
+    pass
 
-# KPIs
 total = int(len(df_filtrado))
 situ = df_filtrado[COL_SITUACAO].apply(normalizar_situacao) if (COL_SITUACAO in df_filtrado.columns and total) else pd.Series([], dtype=str)
 atras = int((situ == "ATRASADA").sum()) if total else 0
@@ -908,6 +1069,14 @@ k2.metric("Em atraso (filtro)", atras)
 k3.metric("Período", f"{p_ini} → {p_fim}")
 k4.metric("Versão", APP_VERSION)
 
+# Informação da base carregada (arquivo + data/hora + período dos dados)
+try:
+    _orig_name = (source_meta.get("original_name") if isinstance(source_meta, dict) else None) or "-"
+    _loaded_at = (source_meta.get("loaded_at") if isinstance(source_meta, dict) else None) or "-"
+    st.caption(f"📌 Base atual: **{_orig_name}** | Carregada em: **{_loaded_at}** | Período dos dados (filtro): **{p_ini} → {p_fim}**")
+except Exception:
+    pass
+
 st.divider()
 tab1, tab2 = st.tabs(["📈 Dashboard", "📦 Exportações (Excel/PDF)"])
 
@@ -916,22 +1085,22 @@ with tab1:
         st.warning("Sem registros no filtro atual.")
         st.stop()
 
-    # gráfico interativo (ocorrências)
+    # Ocorrências (dataset + figura)
     df_occ_plot, level_now, breadcrumb = occurrences_dataset(df_filtrado, ano_sel, mes_sel)
     fig_occ = fig_ocorrencias(df_occ_plot, level_now)
 
-    # seleção do interativo (drill) afeta estes:
+    # Base final (filtros + drill) para Motivos + Pizza
     df_final = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
     df_mot_sel = calc_motivos(df_final, top_n=12)
-    df_resp_sel = calc_resp_analise(df_final)        # histograma
-    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)  # conforme filtro do topo
+    df_resp_sel = calc_resp_analise(df_final)
+    df_atras_filtro = calc_atrasadas_por_filtro(df_filtrado)
 
     fig_mot = fig_motivos(df_mot_sel, "Motivos (Top 12) — seguindo seleção do gráfico Ocorrências")
-    fig_hist = fig_hist_participacao(df_resp_sel, "Participação por responsável (análise) — Histograma (seleção do gráfico Ocorrências)")
+    fig_pie = fig_pizza_participacao(df_resp_sel, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
     titulo_ano = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
     fig_atras = fig_atrasadas_vermelho(df_atras_filtro, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano})")
 
-    # controles drill
+    # Barra superior (controles drill/tabela)
     topbar1, topbar2, topbar3 = st.columns([1.2, 1.4, 3.4])
     with topbar1:
         if can_go_back(level_now, ano_sel, mes_sel):
@@ -945,7 +1114,7 @@ with tab1:
     with topbar3:
         st.caption(f"📌 {breadcrumb}")
 
-    # LINHA 1: Ocorrências (interativo) lado a lado com Motivos
+    # ✅ Linha 1: INTERATIVO (Ocorrências) lado a lado com Motivos
     colL, colR = st.columns(2)
 
     with colL:
@@ -966,7 +1135,7 @@ with tab1:
         if click_supported:
             clicked = get_clicked_x(occ_event)
             if clicked is not None:
-                # tabela por barra clicada
+                # seleção para tabela
                 st.session_state.table_focus_level = level_now
                 st.session_state.table_focus_value = clicked
 
@@ -991,14 +1160,14 @@ with tab1:
     with colR:
         st.plotly_chart(fig_mot, use_container_width=True)
 
-    # LINHA 2: Histograma (participação) + Atrasadas
+    # Linha 2: Pizza + Atrasadas
     row2_left, row2_right = st.columns(2)
     with row2_left:
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_pie, use_container_width=True)
     with row2_right:
         st.plotly_chart(fig_atras, use_container_width=True)
 
-    # tabela final: somente a barra clicada (em cima do drill)
+    # Tabela final (barra clicada)
     if show_table:
         df_table_base = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
         df_table = apply_table_focus(df_table_base)
@@ -1006,7 +1175,6 @@ with tab1:
         info_sel = ""
         if st.session_state.table_focus_level and st.session_state.table_focus_value is not None:
             info_sel = f" | Seleção: {st.session_state.table_focus_level}={st.session_state.table_focus_value}"
-
         st.subheader(f"Recorte (tabela) — filtros + drill + barra clicada{info_sel}")
         st.dataframe(df_table.sort_values(COL_DATA, ascending=False), use_container_width=True, height=380)
 
@@ -1015,7 +1183,6 @@ with tab2:
         st.info("Quando houver registros no filtro, as exportações ficam disponíveis.")
         st.stop()
 
-    # exportações seguem o drill atual
     df_final_export = apply_drill_filters(df_filtrado, ano_sel, mes_sel)
 
     filtro_txt = _titulo_filtro(ano_sel, mes_sel, resp_occ_sel)
@@ -1046,7 +1213,7 @@ with tab2:
 
         titulo_ano_pdf = ano_sel if ano_sel != "(Todos)" else "Todos os anos"
         fig2 = fig_motivos(df_mot_pdf, "Motivos (Top 12) — seleção do gráfico Ocorrências")
-        fig3 = fig_hist_participacao(df_resp_pdf, "Participação por responsável (análise) — Histograma")
+        fig3 = fig_pizza_participacao(df_resp_pdf, "Participação por responsável (análise) — seleção do gráfico Ocorrências")
         fig4 = fig_atrasadas_vermelho(df_atras_pdf, f"Atrasadas por responsável (análise) — conforme filtro (Ano: {titulo_ano_pdf})")
 
         pdf_bytes = build_dashboard_pdf_bytes(
@@ -1067,7 +1234,7 @@ with tab2:
         st.caption("Se citar kaleido/Chrome, mantenha plotly==5.24.1 e kaleido==0.2.1 no requirements.txt")
 
     st.divider()
-    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE) — Histograma")
+    st.subheader("📊 Resumo Excel (DASHBOARD + DADOS + RECORTE) — com Pizza")
 
     titulo_filtro = f"Reclamações — Filtro atual | {filtro_txt}"
     resumo_bytes = build_resumo_excel_bytes(df_final_export, df_filtrado, titulo_filtro)
