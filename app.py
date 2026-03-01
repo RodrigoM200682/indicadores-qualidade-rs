@@ -31,7 +31,7 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V22.02.26_T"
+APP_VERSION = "V01.03.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
