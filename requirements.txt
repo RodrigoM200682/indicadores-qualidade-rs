@@ -1,7 +1,5 @@
-streamlit
-pandas
-openpyxl
+streamlit==1.37.0
+pandas==2.2.2
+numpy==1.26.4
 plotly==5.24.1
-kaleido==0.2.1
-reportlab
-streamlit-plotly-events==0.0.6
+openpyxl==3.1.5
