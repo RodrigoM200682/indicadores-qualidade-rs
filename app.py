@@ -31,7 +31,7 @@ from reportlab.lib.utils import ImageReader
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V01.03.26"
+APP_VERSION = "V22.02.26_T"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
@@ -1240,28 +1240,31 @@ with tab1:
 
         _opened_as_dialog = False
 
-        # Streamlit >= 1.32 (st.dialog) – mas algumas versões expõem a função sem suportar "with"
+        # Preferência: modal nativo (padrão novo) — st.dialog é um *decorator*, não um context manager
         if hasattr(st, "dialog"):
             try:
-                with st.dialog(title_recorte):
+                @st.dialog(title_recorte)
+                def _dlg_recorte():
                     _render_recorte_table()
+                _dlg_recorte()
                 _opened_as_dialog = True
             except Exception:
                 _opened_as_dialog = False
 
-        # Streamlit mais antigo (experimental_dialog)
+        # Compatibilidade: versões intermediárias — st.experimental_dialog também é decorator
         if (not _opened_as_dialog) and hasattr(st, "experimental_dialog"):
             try:
-                with st.experimental_dialog(title_recorte):
+                @st.experimental_dialog(title_recorte)
+                def _dlg_recorte_exp():
                     _render_recorte_table()
+                _dlg_recorte_exp()
                 _opened_as_dialog = True
             except Exception:
                 _opened_as_dialog = False
 
-        # Fallback universal (sempre funciona)
+        # Fallback universal (sempre funciona): painel expansível (sem aviso “de erro” para o usuário)
         if not _opened_as_dialog:
             with st.expander(title_recorte, expanded=True):
-                st.caption("⚠️ Seu Streamlit não suportou dialog/modal; uso este painel expansível como alternativa.")
                 _render_recorte_table()
 
 # Tabela final (barra clicada)
