@@ -1,4 +1,4 @@
-# app.py — INDICADORES QUALIDADE RS (WEB) — V01.03.26
+# app.py — INDICADORES QUALIDADE RS (WEB) — Versão final
 # Atualização desta versão:
 # - Painel interativo (Ocorrências) agora aparece APENAS UMA VEZ e fica LADO A LADO com Motivos (Top 12)
 # - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Participação (barras) e Atrasadas
@@ -69,53 +69,10 @@ def _load_last_upload():
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V01.03.26_F"
+APP_VERSION = "V01.03.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
-
-
-# =========================
-# Logo (painel principal)
-# =========================
-def render_logo(max_height: int = 90):
-    """Renderiza o logo no painel principal.
-    - Preferência: imagem (png/jpg) -> st.image
-    - Se vier em PDF: tenta converter 1ª página (PyMuPDF). Se não houver, embute o PDF em um <embed>.
-    """
-    candidates = ["Logo_Brasilata.png", "Logo_Brasilata.jpg", "Logo_Brasilata.jpeg", "Logo_Brasilata.pdf"]
-    p = next((Path(__file__).with_name(n) for n in candidates if Path(__file__).with_name(n).exists()), None)
-    if not p:
-        return
-
-    ext = p.suffix.lower()
-
-    if ext in {".png", ".jpg", ".jpeg"}:
-        st.image(str(p), height=max_height)
-        return
-
-    if ext == ".pdf":
-        # 1) tentativa: converter a 1ª página para imagem (se PyMuPDF estiver disponível)
-        try:
-            import fitz  # type: ignore
-            doc = fitz.open(str(p))
-            page = doc.load_page(0)
-            pix = page.get_pixmap(alpha=True)
-            st.image(pix.tobytes("png"), height=max_height)
-            return
-        except Exception:
-            pass
-
-        # 2) fallback: embutir PDF (funciona sem dependências)
-        try:
-            import base64
-            b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
-            html = f"""<embed src='data:application/pdf;base64,{b64}' width='240' height='{max_height}' type='application/pdf'>"""
-            st.markdown(html, unsafe_allow_html=True)
-        except Exception:
-            # último fallback: apenas botão para baixar/abrir
-            st.download_button("Baixar logo", data=p.read_bytes(), file_name=p.name)
-        return
 
 # Colunas esperadas (base Reclamações)
 COL_CODIGO = "Código"
@@ -410,14 +367,13 @@ def build_dashboard_pdf_bytes(app_name: str, filtro_txt: str, kpis: dict, figs_p
     c.drawString(margin, H - margin - 40, f"Filtro: {filtro_txt[:180]}")
 
     c.setFont("Helvetica-Bold", 10)
-    c.setFont("Helvetica-Bold", 12)
-c.drawString(margin, H - margin - 58, "Ocorrências")
-
-c.setFont("Helvetica-Bold", 10)
-c.drawString(margin, H - margin - 72, f"Total: {kpis.get('total', 0)}   |   Em atraso: {kpis.get('atras', 0)}")
-
-c.setFont("Helvetica", 9)
-c.drawString(margin, H - margin - 86, f"Período: {kpis.get('periodo', '-')}   |   Versão: {APP_VERSION}")
+    kpi_line = (
+        f"Total: {kpis.get('total', 0)}   |   "
+        f"Em atraso: {kpis.get('atras', 0)}   |   "
+        f"Período: {kpis.get('periodo', '-')}   |   "
+        f"Versão: {APP_VERSION}"
+    )
+    c.drawString(margin, H - margin - 58, kpi_line)
 
     gap = 12
     cell_w = (content_w - gap) / 2
@@ -997,10 +953,6 @@ def build_resumo_excel_bytes(df_filtrado_final: pd.DataFrame, df_filtro_base: pd
 # UI Streamlit
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
-
-# Logo no topo do painel
-render_logo(max_height=85)
-st.divider()
 require_login()
 init_drill_state()
 
@@ -1091,14 +1043,11 @@ atras = int((situ == "ATRASADA").sum()) if total else 0
 p_ini = br_date_str(df_filtrado[COL_DATA].min()) if total else "-"
 p_fim = br_date_str(df_filtrado[COL_DATA].max()) if total else "-"
 
-st.markdown("### Ocorrências")
-c1, c2 = st.columns(2)
-c1.metric("Total", total)
-c2.metric("Em Atraso", atras)
-
-c3, c4 = st.columns(2)
-c3.metric("Período", f"{p_ini} → {p_fim}")
-c4.metric("Versão", APP_VERSION)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total ocorrências", total)
+k2.metric("Em atraso (filtro)", atras)
+k3.metric("Período", f"{p_ini} → {p_fim}")
+k4.metric("Versão", APP_VERSION)
 
 st.divider()
 tab1, tab2 = st.tabs(["📈 Dashboard", "📦 Exportações (Excel/PDF)"])
