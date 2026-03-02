@@ -1,4 +1,4 @@
-# app.py — INDICADORES QUALIDADE RS (WEB) — V18.02.26
+# app.py — INDICADORES QUALIDADE RS (WEB) — Versão final
 # Atualização desta versão:
 # - Painel interativo (Ocorrências) agora aparece APENAS UMA VEZ e fica LADO A LADO com Motivos (Top 12)
 # - Mantém: drill (Ano->Mês->Semana), botão Voltar, Reset drill, Tabela por barra clicada, Participação (barras) e Atrasadas
@@ -69,7 +69,7 @@ def _load_last_upload():
 # =========================================================
 # APP
 # =========================================================
-APP_VERSION = "V22.02.26_T"
+APP_VERSION = "V01.03.26"
 APP_NAME = f"INDICADORES QUALIDADE RS — {APP_VERSION}"
 DEFAULT_SHEET = "Sheet1"
 APP_PASSWORD = "QualidadeRS"
